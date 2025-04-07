@@ -102,58 +102,74 @@ void pcl_handler(T &msg)
   mBuf.unlock();
 }
 
+/**
+ * @brief 同步点云和IMU数据包
+ * @param pl_ptr 输出的点云数据指针
+ * @param imus 输出的IMU数据队列
+ * @param p_imu IMU EKF处理器
+ * @return 如果成功同步返回true，否则返回false
+ */
 bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::Imu::Ptr> &imus, IMUEKF &p_imu)
 {
-  static bool pl_ready = false;
+  static bool pl_ready = false;  // 标记点云数据是否准备好
 
+  // 如果点云数据未准备好，尝试从缓冲区获取新的点云数据
   if(!pl_ready)
   {
-    if(pcl_buf.empty()) return false;
+    if(pcl_buf.empty()) return false;  // 如果点云缓冲区为空，返回false
 
+    // 从缓冲区获取点云数据
     mBuf.lock();
-    pl_ptr = pcl_buf.front();
-    p_imu.pcl_beg_time = time_buf.front();
-    pcl_buf.pop_front(); time_buf.pop_front();
+    pl_ptr = pcl_buf.front();  // 获取最早的点云数据
+    p_imu.pcl_beg_time = time_buf.front();  // 记录点云开始时间
+    pcl_buf.pop_front(); time_buf.pop_front();  // 从缓冲区移除已处理的数据
     mBuf.unlock();
 
+    // 计算点云结束时间（开始时间 + 最后一个点的曲率值）
     p_imu.pcl_end_time = p_imu.pcl_beg_time + pl_ptr->back().curvature;
 
+    // 处理无时间戳的点云数据
     if(point_notime)
     {
-      if(last_pcl_time < 0)
+      if(last_pcl_time < 0)  // 如果是第一个点云
       {
         last_pcl_time = p_imu.pcl_beg_time;
         return false;
       }
 
+      // 更新时间戳
       p_imu.pcl_end_time = p_imu.pcl_beg_time;
       p_imu.pcl_beg_time = last_pcl_time;
       last_pcl_time = p_imu.pcl_end_time;
     }
 
-    pl_ready = true;
+    pl_ready = true;  // 标记点云数据已准备好
   }
 
+  // 检查是否满足同步条件
   if(!pl_ready || imu_last_time <= p_imu.pcl_end_time) return false;
 
+  // 从IMU缓冲区获取对应时间段的IMU数据
   mBuf.lock();
   double imu_time = imu_buf.front()->header.stamp.toSec();
   while((!imu_buf.empty()) && (imu_time < p_imu.pcl_end_time)) 
   {
     imu_time = imu_buf.front()->header.stamp.toSec();
     if(imu_time > p_imu.pcl_end_time) break;
-    imus.push_back(imu_buf.front());
-    imu_buf.pop_front();
+    imus.push_back(imu_buf.front());  // 将IMU数据添加到输出队列
+    imu_buf.pop_front();  // 从缓冲区移除已处理的IMU数据
   }
   mBuf.unlock();
 
+  // 检查IMU缓冲区是否为空
   if(imu_buf.empty())
   {
     printf("imu buf empty\n"); exit(0);
   }
 
-  pl_ready = false;
+  pl_ready = false;  // 重置点云准备状态
 
+  // 如果收集到足够多的IMU数据（>4个），返回true
   if(imus.size() > 4)
     return true;
   else
@@ -183,32 +199,67 @@ void calcBodyVar(Eigen::Vector3d &pb, const float range_inc, const float degree_
   var = direction * range_var * direction.transpose() + A * direction_var * A.transpose();
 };
 
-// Compute the variance of the each point
+/**
+ * @brief 初始化点云中每个点的方差矩阵
+ * @param ext 当前帧的IMU状态（包含旋转矩阵R和平移向量p）
+ * @param pl_cur 当前帧的点云数据
+ * @param pptr 存储点云方差信息的指针
+ * @param dept_err 深度测量误差
+ * @param beam_err 光束角度误差
+ */
 void var_init(IMUST &ext, pcl::PointCloud<PointType> &pl_cur, PVecPtr pptr, double dept_err, double beam_err)
 {
-  int plsize = pl_cur.size();
-  pptr->clear();
-  pptr->resize(plsize);
+  int plsize = pl_cur.size();  // 获取点云中点的数量
+  pptr->clear();  // 清空方差容器
+  pptr->resize(plsize);  // 重新分配空间
+  
+  // 遍历点云中的每个点
   for(int i=0; i<plsize; i++)
   {
-    PointType &ap = pl_cur[i];
-    pointVar &pv = pptr->at(i);
+    PointType &ap = pl_cur[i];  // 获取当前点
+    pointVar &pv = pptr->at(i);  // 获取对应的方差结构体
+    
+    // 将点坐标赋值给方差结构体
     pv.pnt << ap.x, ap.y, ap.z;
+    
+    // 计算点在体坐标系下的方差矩阵
     calcBodyVar(pv.pnt, dept_err, beam_err, pv.var);
+    
+    // 将点转换到世界坐标系
     pv.pnt = ext.R * pv.pnt + ext.p;
+    
+    // 将方差矩阵转换到世界坐标系
     pv.var = ext.R * pv.var * ext.R.transpose();
   }
 }
 
+/**
+ * @brief 更新点云中每个点的协方差矩阵并转换到世界坐标系
+ * @param pptr 存储点云及其方差信息的指针
+ * @param x_curr 当前IMU状态（包含位姿和协方差信息）
+ * @param pwld 存储转换到世界坐标系的点云容器
+ */
 void pvec_update(PVecPtr pptr, IMUST &x_curr, PLV(3) &pwld)
 {
+  // 从IMU状态协方差矩阵中提取旋转部分的3x3协方差子矩阵
   Eigen::Matrix3d rot_var = x_curr.cov.block<3, 3>(0, 0);
+  // 从IMU状态协方差矩阵中提取平移部分的3x3协方差子矩阵
   Eigen::Matrix3d tsl_var = x_curr.cov.block<3, 3>(3, 3);
 
+  // 遍历每个点及其方差信息
   for(pointVar &pv: *pptr)
   {
+    // 将点坐标转换为反对称矩阵（用于叉积运算）
     Eigen::Matrix3d phat = hat(pv.pnt);
+    
+    // 更新点的协方差矩阵，考虑三个不确定性来源：
+    // 1. 原始点的不确定性：x_curr.R * pv.var * x_curr.R.transpose()
+    // 2. 旋转不确定性的影响：phat * rot_var * phat.transpose()
+    // 3. 平移不确定性的影响：tsl_var
     pv.var = x_curr.R * pv.var * x_curr.R.transpose() + phat * rot_var * phat.transpose() + tsl_var;
+    
+    // 将点从局部坐标系转换到世界坐标系：p_world = R * p_local + t
+    // 并将转换后的点添加到世界坐标系点云容器中
     pwld.push_back(x_curr.R * pv.pnt + x_curr.p);
   }
 }

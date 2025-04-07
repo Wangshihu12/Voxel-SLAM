@@ -877,44 +877,62 @@ public:
   // The point-to-plane alignment for odometry
   bool lio_state_estimation(PVecPtr pptr)
   {
+    // 保存当前状态作为初始值
     IMUST x_prop = x_curr;
 
+    // 设置最大迭代次数
     const int num_max_iter = 4;
+    // 定义EKF停止和收敛标志
     bool EKF_stop_flg = 0, flg_EKF_converged = 0;
+    // 定义状态矩阵
     Eigen::Matrix<double, DIM, DIM> G, H_T_H, I_STATE;
     G.setZero();
     H_T_H.setZero();
     I_STATE.setIdentity();
+    // 重匹配次数和匹配点数统计
     int rematch_num = 0;
     int match_num = 0;
 
+    // 获取点云大小并初始化八叉树容器
     int psize = pptr->size();
     vector<OctoTree *> octos;
     octos.resize(psize, nullptr);
 
+    // 初始化协方差矩阵
     Eigen::Matrix3d nnt;
     Eigen::Matrix<double, DIM, DIM> cov_inv = x_curr.cov.inverse();
+    
+    // 开始迭代优化
     for (int iterCount = 0; iterCount < num_max_iter; iterCount++)
     {
+      // 初始化Hessian矩阵和残差向量
       Eigen::Matrix<double, 6, 6> HTH;
       HTH.setZero();
       Eigen::Matrix<double, 6, 1> HTz;
       HTz.setZero();
+      
+      // 获取旋转和平移的协方差
       Eigen::Matrix3d rot_var = x_curr.cov.block<3, 3>(0, 0);
       Eigen::Matrix3d tsl_var = x_curr.cov.block<3, 3>(3, 3);
       match_num = 0;
       nnt.setZero();
 
+      // 遍历所有点进行点面匹配
       for (int i = 0; i < psize; i++)
       {
         pointVar &pv = pptr->at(i);
+        // 计算点的斜对称矩阵
         Eigen::Matrix3d phat = hat(pv.pnt);
+        // 计算点在全局坐标系下的协方差
         Eigen::Matrix3d var_world = x_curr.R * pv.var * x_curr.R.transpose() + phat * rot_var * phat.transpose() + tsl_var;
+        // 将点转换到全局坐标系
         Eigen::Vector3d wld = x_curr.R * pv.pnt + x_curr.p;
 
         double sigma_d = 0;
         Plane *pla = nullptr;
         int flag = 0;
+        
+        // 尝试在八叉树中匹配平面
         if (octos[i] != nullptr && octos[i]->inside(wld))
         {
           double max_prob = 0;
@@ -925,16 +943,21 @@ public:
           flag = match(surf_map, wld, pla, var_world, sigma_d, octos[i]);
         }
 
+        // 如果找到匹配的平面，计算残差和雅可比矩阵
         if (flag)
-        // if(pla != nullptr)
         {
           Plane &pp = *pla;
+          // 计算信息矩阵
           double R_inv = 1.0 / (0.0005 + sigma_d);
+          // 计算点到平面的距离残差
           double resi = pp.normal.dot(wld - pp.center);
 
+          // 计算雅可比矩阵
           Eigen::Matrix<double, 6, 1> jac;
           jac.head(3) = phat * x_curr.R.transpose() * pp.normal;
           jac.tail(3) = pp.normal;
+          
+          // 更新Hessian矩阵和残差向量
           HTH += R_inv * jac * jac.transpose();
           HTz -= R_inv * jac * resi;
           nnt += pp.normal * pp.normal.transpose();
@@ -942,27 +965,33 @@ public:
         }
       }
 
+      // 更新状态估计
       H_T_H.block<6, 6>(0, 0) = HTH;
       Eigen::Matrix<double, DIM, DIM> K_1 = (H_T_H + cov_inv).inverse();
       G.block<DIM, 6>(0, 0) = K_1.block<DIM, 6>(0, 0) * HTH;
       Eigen::Matrix<double, DIM, 1> vec = x_prop - x_curr;
       Eigen::Matrix<double, DIM, 1> solution = K_1.block<DIM, 6>(0, 0) * HTz + vec - G.block<DIM, 6>(0, 0) * vec.block<6, 1>(0, 0);
 
+      // 更新当前状态
       x_curr += solution;
       Eigen::Vector3d rot_add = solution.block<3, 1>(0, 0);
       Eigen::Vector3d tra_add = solution.block<3, 1>(3, 0);
 
+      // 检查收敛条件
       EKF_stop_flg = false;
       flg_EKF_converged = false;
 
+      // 如果旋转和平移变化都很小，认为收敛
       if ((rot_add.norm() * 57.3 < 0.01) && (tra_add.norm() * 100 < 0.015))
         flg_EKF_converged = true;
 
+      // 在收敛或最后一次迭代前进行重匹配
       if (flg_EKF_converged || ((rematch_num == 0) && (iterCount == num_max_iter - 2)))
       {
         rematch_num++;
       }
 
+      // 如果重匹配次数达到2次或达到最大迭代次数，更新协方差并停止
       if (rematch_num >= 2 || (iterCount == num_max_iter - 1))
       {
         x_curr.cov = (I_STATE - G) * x_curr.cov;
@@ -973,10 +1002,11 @@ public:
         break;
     }
 
+    // 检查优化结果的质量
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(nnt);
     Eigen::Vector3d evalue = saes.eigenvalues();
-    // printf("eva %d: %lf\n", match_num, evalue[0]);
 
+    // 如果最小特征值太小，认为优化失败
     if (evalue[0] < 14)
       return false;
     else
@@ -1140,26 +1170,36 @@ public:
   // After detecting loop closure, refine current map and states
   void loop_update()
   {
+    // 打印当前滑动窗口大小
     printf("loop update: %zu\n", sws[0].size());
     double t1 = ros::Time::now().toSec();
+
+    // 清理当前表面特征地图
     for (auto iter = surf_map.begin(); iter != surf_map.end(); iter++)
     {
-      // octos_release.push_back(iter->second);
+      // 将八叉树节点转移到释放队列
       iter->second->tras_ptr(octos_release);
+      // 清除滑动窗口中的特征
       iter->second->clear_slwd(sws[0]);
+      // 删除八叉树节点
       delete iter->second;
       iter->second = nullptr;
     }
+    // 清空当前地图和滑动窗口地图
     surf_map.clear();
     surf_map_slide.clear();
+    // 将回环地图复制到当前地图
     surf_map = map_loop;
     map_loop.clear();
 
+    // 打印各种数据结构的大小
     printf("scanPoses: %zu %zu %zu %d %d %zu\n", scanPoses->size(), buf_lba2loop.size(), x_buf.size(), win_base, win_count, sws[0].size());
     int blsize = scanPoses->size();
+    // 保存第一个点用于后续更新
     PointType ap = pcl_path[0];
     pcl_path.clear();
 
+    // 更新回环前的路径点
     for (int i = 0; i < blsize; i++)
     {
       ap.x = scanPoses->at(i)->x.p[0];
@@ -1168,8 +1208,10 @@ public:
       pcl_path.push_back(ap);
     }
 
+    // 更新回环检测到的位姿
     for (ScanPose *bl : buf_lba2loop)
     {
+      // 应用回环修正
       bl->update(dx);
       ap.x = bl->x.p[0];
       ap.y = bl->x.p[1];
@@ -1177,98 +1219,134 @@ public:
       pcl_path.push_back(ap);
     }
 
+    // 更新当前窗口内的位姿
     for (int i = 0; i < win_count; i++)
     {
       IMUST &x = x_buf[i];
+      // 应用回环修正到速度、位置和旋转
       x.v = dx.R * x.v;
       x.p = dx.R * x.p + dx.p;
       x.R = dx.R * x.R;
+      // 如果需要更新重力向量
       if (g_update == 1)
         x.g = dx.R * x.g;
-      // PointType ap;
+      // 更新路径点
       ap.x = x.p[0];
       ap.y = x.p[1];
       ap.z = x.p[2];
       pcl_path.push_back(ap);
     }
 
+    // 发布更新后的路径
     pub_pl_func(pcl_path, pub_curr_path);
 
+    // 更新当前位姿
     x_curr.R = x_buf[win_count - 1].R;
     x_curr.p = x_buf[win_count - 1].p;
     x_curr.v = dx.R * x_curr.v;
     x_curr.g = x_buf[win_count - 1].g;
 
+    // 重置窗口索引
     for (int i = 0; i < win_size; i++)
       mp[i] = i;
 
+    // 更新回环检测到的特征点
     for (ScanPose *bl : buf_lba2loop)
     {
       IMUST xx = bl->x;
       PVec pvec_tem = *(bl->pvec);
+      // 将特征点转换到世界坐标系
       for (pointVar &pv : pvec_tem)
         pv.pnt = xx.R * pv.pnt + xx.p;
+      // 将特征点添加到体素地图
       cut_voxel(surf_map, pvec_tem, win_size, 0);
     }
 
-    PLV(3)
-    pwld;
+    // 更新当前窗口内的特征点
+    PLV(3) pwld;
     for (int i = 0; i < win_count; i++)
     {
       pwld.clear();
+      // 将特征点转换到世界坐标系
       for (pointVar &pv : *pvec_buf[i])
         pwld.push_back(x_buf[i].R * pv.pnt + x_buf[i].p);
+      // 将特征点添加到体素地图
       cut_voxel(surf_map, pvec_buf[i], i, surf_map_slide, win_size, pwld, sws[0]);
     }
 
+    // 重新切分所有特征
     for (auto iter = surf_map.begin(); iter != surf_map.end(); ++iter)
       iter->second->recut(win_count, x_buf, sws[0]);
 
+    // 更新重力向量状态
     if (g_update == 1)
       g_update = 2;
+    // 重置回环检测标志
     loop_detect = 0;
+    // 打印处理时间
     double t2 = ros::Time::now().toSec();
     printf("loop head: %lf %zu\n", t2 - t1, sws[0].size());
   }
 
-  // load the previous keyframe in the local voxel map
+  /**
+   * @brief 将之前的关键帧加载到局部体素地图中
+   * @param jour 当前时间戳
+   */
   void keyframe_loading(double jour)
   {
+    // 如果没有历史关键帧，直接返回
     if (history_kfsize <= 0)
       return;
     double tt1 = ros::Time::now().toSec();
+
+    // 构造当前位置的点用于KD树搜索
     PointType ap_curr;
     ap_curr.x = x_curr.p[0];
     ap_curr.y = x_curr.p[1];
     ap_curr.z = x_curr.p[2];
+
+    // 用于存储KD树搜索结果
     vector<int> vec_idx;
     vector<float> vec_dis;
+    // 在KD树中搜索10米范围内的关键帧
     kd_keyframes.radiusSearch(ap_curr, 10, vec_idx, vec_dis);
 
+    // 遍历搜索到的关键帧
     for (int id : vec_idx)
     {
+      // 获取关键帧的序号
       int ord_kf = pl_kdmap->points[id].curvature;
+      // 检查关键帧是否有效
       if (keyframes->at(id)->exist)
       {
+        // 获取关键帧引用
         Keyframe &kf = *(keyframes->at(id));
-        IMUST &xx = kf.x0;
-        PVec pvec;
+        IMUST &xx = kf.x0;  // 获取关键帧位姿
+        PVec pvec;  // 用于存储转换后的点云
         pvec.reserve(kf.plptr->size());
 
+        // 初始化点的方差
         pointVar pv;
         pv.var.setZero();
         int plsize = kf.plptr->size();
-        // for(int j=0; j<plsize; j+=2)
+        
+        // 遍历关键帧中的所有点
         for (int j = 0; j < plsize; j++)
         {
+          // 获取原始点坐标
           PointType ap = kf.plptr->points[j];
+          // 将点坐标转换为向量形式
           pv.pnt << ap.x, ap.y, ap.z;
+          // 将点从关键帧坐标系转换到世界坐标系
           pv.pnt = xx.R * pv.pnt + xx.p;
           pvec.push_back(pv);
         }
 
+        // 将转换后的点云添加到体素地图中
         cut_voxel(surf_map, pvec, win_size, jour);
+        // 标记该关键帧已被处理
         kf.exist = 0;
+        // 更新历史关键帧计数
         history_kfsize--;
         break;
       }
@@ -1371,37 +1449,55 @@ public:
     return 0;
   }
 
+  // 系统重置函数，用于重置SLAM系统的状态
   void system_reset(deque<sensor_msgs::Imu::Ptr> &imus)
   {
+    // 清理表面特征地图
     for (auto iter = surf_map.begin(); iter != surf_map.end(); iter++)
     {
+      // 将八叉树节点转移到释放队列
       iter->second->tras_ptr(octos_release);
+      // 清除滑动窗口中的特征
       iter->second->clear_slwd(sws[0]);
+      // 删除八叉树节点
       delete iter->second;
     }
+    // 清空表面特征地图和滑动窗口特征地图
     surf_map.clear();
     surf_map_slide.clear();
 
+    // 重置当前位姿状态
     x_curr.setZero();
+    // 设置初始位置为(0,0,30)
     x_curr.p = Eigen::Vector3d(0, 0, 30);
+    // 重置IMU EKF状态
     odom_ekf.mean_acc.setZero();
     odom_ekf.init_num = 0;
+    // 重新初始化IMU
     odom_ekf.IMU_init(imus);
+    // 设置重力向量
     x_curr.g = -odom_ekf.mean_acc * imupre_scale_gravity;
 
+    // 清理IMU预积分缓冲区
     for (int i = 0; i < imu_pre_buf.size(); i++)
       delete imu_pre_buf[i];
+    // 清空各种缓冲区
     x_buf.clear();
     pvec_buf.clear();
     imu_pre_buf.clear();
     pl_tree->clear();
 
+    // 重置滑动窗口索引
     for (int i = 0; i < win_size; i++)
       mp[i] = i;
+    // 重置窗口基址和计数
     win_base = 0;
     win_count = 0;
+    // 清空点云路径
     pcl_path.clear();
+    // 发布清空后的地图
     pub_pl_func(pcl_path, pub_cmap);
+    // 输出重置提示
     ROS_WARN("Reset");
   }
 
@@ -1409,6 +1505,7 @@ public:
   // multi means multiple thread
   void multi_margi(unordered_map<VOXEL_LOC, OctoTree *> &feat_map, double jour, int win_count, vector<IMUST> &xs, LidarFactor &voxopt, vector<SlideWindow *> &sw)
   {
+    // 注释掉的代码是单线程版本，用于参考
     // for(auto iter=feat_map.begin(); iter!=feat_map.end();)
     // {
     //   iter->second->jour = jour;
@@ -1423,17 +1520,25 @@ public:
     // }
     // return;
 
+    // 设置线程数量
     int thd_num = thread_num;
+    // 为每个线程创建八叉树节点容器
     vector<vector<OctoTree *> *> octs;
     for (int i = 0; i < thd_num; i++)
       octs.push_back(new vector<OctoTree *>());
 
+    // 获取特征地图大小，如果小于线程数则直接返回
     int g_size = feat_map.size();
     if (g_size < thd_num)
       return;
+
+    // 创建线程数组
     vector<thread *> mthreads(thd_num);
+    // 计算每个线程需要处理的特征数量
     double part = 1.0 * g_size / thd_num;
     int cnt = 0;
+
+    // 将特征均匀分配到各个线程的容器中
     for (auto iter = feat_map.begin(); iter != feat_map.end(); iter++)
     {
       iter->second->jour = jour;
@@ -1442,19 +1547,23 @@ public:
         cnt++;
     }
 
+    // 定义边缘化处理函数
     auto margi_func = [](int win_cnt, vector<OctoTree *> *oct, vector<IMUST> xxs, LidarFactor &voxhess)
     {
+      // 对每个八叉树节点执行边缘化操作
       for (OctoTree *oc : *oct)
       {
         oc->margi(win_cnt, 1, xxs, voxhess);
       }
     };
 
+    // 启动其他线程执行边缘化
     for (int i = 1; i < thd_num; i++)
     {
       mthreads[i] = new thread(margi_func, win_count, octs[i], xs, ref(voxopt));
     }
 
+    // 主线程执行第一个分区的边缘化，并等待其他线程完成
     for (int i = 0; i < thd_num; i++)
     {
       if (i == 0)
@@ -1468,6 +1577,7 @@ public:
       }
     }
 
+    // 清理不存在的特征
     for (auto iter = feat_map.begin(); iter != feat_map.end();)
     {
       if (iter->second->isexist)
@@ -1479,6 +1589,7 @@ public:
       }
     }
 
+    // 释放线程容器内存
     for (int i = 0; i < thd_num; i++)
       delete octs[i];
   }
@@ -1541,30 +1652,35 @@ public:
       iter->second->tras_opt(voxopt);
   }
 
-  // The main thread of odometry and local mapping
+  // 里程计和局部建图线程函数
   void thd_odometry_localmapping(ros::NodeHandle &n)
   {
-    PLV(3)
-    pwld;
-    double down_sizes[3] = {0.1, 0.2, 0.4};
-    Eigen::Vector3d last_pos(0, 0, 0);
-    double jour = 0;
-    int counter = 0;
+    // 初始化变量
+    PLV(3) pwld;  // 世界坐标系下的点云
+    double down_sizes[3] = {0.1, 0.2, 0.4};  // 降采样体素大小
+    Eigen::Vector3d last_pos(0, 0, 0);  // 上一帧位置
+    double jour = 0;  // 时间戳
+    int counter = 0;  // 计数器
 
+    // 点云相关变量初始化
     pcl::PointCloud<PointType>::Ptr pcl_curr(new pcl::PointCloud<PointType>());
-    int motion_init_flag = 1;
+    int motion_init_flag = 1;  // 运动初始化标志
     pl_tree.reset(new pcl::PointCloud<PointType>());
-    vector<pcl::PointCloud<PointType>::Ptr> pl_origs;
-    vector<double> beg_times;
-    vector<deque<sensor_msgs::Imu::Ptr>> vec_imus;
-    bool release_flag = false;
-    int degrade_cnt = 0;
-    LidarFactor voxhess(win_size);
-    const int mgsize = 1;
-    Eigen::MatrixXd hess;
+    vector<pcl::PointCloud<PointType>::Ptr> pl_origs;  // 原始点云
+    vector<double> beg_times;  // 开始时间
+    vector<deque<sensor_msgs::Imu::Ptr>> vec_imus;  // IMU数据队列
+    bool release_flag = false;  // 释放标志
+    int degrade_cnt = 0;  // 退化计数
+    LidarFactor voxhess(win_size);  // 激光雷达因子
+    const int mgsize = 1;  // 边缘化大小
+    Eigen::MatrixXd hess;  // 海森矩阵
+
+    // 主循环
     while (n.ok())
     {
-      ros::spinOnce();
+      ros::spinOnce();  // 处理ROS回调
+
+      // 处理回环检测
       if (loop_detect == 1)
       {
         loop_update();
@@ -1572,15 +1688,18 @@ public:
         jour = 0;
       }
 
+      // 检查是否结束
       n.param<bool>("finish", is_finish, false);
       if (is_finish)
       {
         break;
       }
 
+      // 同步数据包
       deque<sensor_msgs::Imu::Ptr> imus;
       if (!sync_packages(pcl_curr, imus, odom_ekf))
       {
+        // 内存管理：释放八叉树节点
         if (octos_release.size() != 0)
         {
           int msize = octos_release.size();
@@ -1593,6 +1712,7 @@ public:
           }
           malloc_trim(0);
         }
+        // 释放长时间未使用的特征
         else if (release_flag)
         {
           release_flag = false;
@@ -1601,7 +1721,6 @@ public:
           {
             int dis = jour - iter->second->jour;
             if (dis < 700)
-            // if(dis < 200)
             {
               iter++;
             }
@@ -1618,6 +1737,7 @@ public:
           octos.clear();
           malloc_trim(0);
         }
+        // 释放滑动窗口
         else if (sws[0].size() > 10000)
         {
           for (int i = 0; i < 500; i++)
@@ -1632,6 +1752,7 @@ public:
         continue;
       }
 
+      // 第一次运行时的初始化
       static int first_flag = 1;
       if (first_flag)
       {
@@ -1641,9 +1762,11 @@ public:
         first_flag = 0;
       }
 
+      // 记录时间点
       double t0 = ros::Time::now().toSec();
       double t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0, t8 = 0;
 
+      // 运动初始化
       if (motion_init_flag)
       {
         int init = initialization(imus, hess, voxhess, pwld, pcl_curr);
@@ -1661,9 +1784,11 @@ public:
       }
       else
       {
+        // IMU里程计处理
         if (odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
           continue;
 
+        // 点云降采样
         pcl::PointCloud<PointType> pl_down = *pcl_curr;
         down_sampling_voxel(pl_down, down_size);
 
@@ -1673,9 +1798,11 @@ public:
           down_sampling_voxel(pl_down, down_size / 2);
         }
 
+        // 初始化点云向量
         PVecPtr pptr(new PVec);
         var_init(extrin_para, pl_down, pptr, dept_err, beam_err);
 
+        // 激光雷达状态估计
         if (lio_state_estimation(pptr))
         {
           if (degrade_cnt > 0)
@@ -1684,12 +1811,14 @@ public:
         else
           degrade_cnt++;
 
+        // 更新世界坐标系下的点云
         pwld.clear();
         pvec_update(pptr, x_curr, pwld);
         ResultOutput::instance().pub_localtraj(pwld, jour, x_curr, sessionNames.size() - 1, pcl_path);
 
         t1 = ros::Time::now().toSec();
 
+        // 更新窗口状态
         win_count++;
         x_buf.push_back(x_curr);
         pvec_buf.push_back(pptr);
@@ -1699,17 +1828,20 @@ public:
           imu_pre_buf[win_count - 2]->push_imu(imus);
         }
 
+        // 加载关键帧
         keyframe_loading(jour);
         voxhess.clear();
         voxhess.win_size = win_size;
 
-        // cut_voxel(surf_map, pvec_buf[win_count-1], win_count-1, surf_map_slide, win_size, pwld, sws[0]);
+        // 体素化处理
         cut_voxel_multi(surf_map, pvec_buf[win_count - 1], win_count - 1, surf_map_slide, win_size, pwld, sws);
         t2 = ros::Time::now().toSec();
 
+        // 多线程重切分
         multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
         t3 = ros::Time::now().toSec();
 
+        // 处理退化情况
         if (degrade_cnt > degrade_bound)
         {
           degrade_cnt = 0;
@@ -1730,10 +1862,12 @@ public:
         }
       }
 
+      // 窗口满时的处理
       if (win_count >= win_size)
       {
         t4 = ros::Time::now().toSec();
 
+        // 重力更新
         if (g_update == 2)
         {
           LI_BA_OptimizerGravity opt_lsv;
@@ -1745,10 +1879,12 @@ public:
         }
         else
         {
+          // 局部BA优化
           LI_BA_Optimizer opt_lsv;
           opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
         }
 
+        // 创建新的扫描位姿
         ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);
         bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
         for (int i = 0; i < 6; i++)
@@ -1757,15 +1893,19 @@ public:
         buf_lba2loop.push_back(bl);
         mtx_loop.unlock();
 
+        // 更新当前位姿
         x_curr.R = x_buf[win_count - 1].R;
         x_curr.p = x_buf[win_count - 1].p;
         t5 = ros::Time::now().toSec();
 
+        // 发布局部地图
         ResultOutput::instance().pub_localmap(mgsize, sessionNames.size() - 1, pvec_buf, x_buf, pcl_path, win_base, win_count);
 
+        // 多线程边缘化
         multi_margi(surf_map_slide, jour, win_count, x_buf, voxhess, sws[0]);
         t6 = ros::Time::now().toSec();
 
+        // 更新jour和last_pos
         if ((win_base + win_count) % 10 == 0)
         {
           double spat = (x_curr.p - last_pos).norm();
@@ -1777,12 +1917,14 @@ public:
           }
         }
 
+        // 保存地图
         if (is_save_map)
         {
           for (int i = 0; i < mgsize; i++)
             FileReaderWriter::instance().save_pcd(pvec_buf[i], x_buf[i], win_base + i, savepath + bagname);
         }
 
+        // 更新窗口索引
         for (int i = 0; i < win_size; i++)
         {
           mp[i] += mgsize;
@@ -1790,6 +1932,7 @@ public:
             mp[i] -= win_size;
         }
 
+        // 滑动窗口更新
         for (int i = mgsize; i < win_count; i++)
         {
           x_buf[i - mgsize] = x_buf[i];
@@ -1798,6 +1941,7 @@ public:
           pvec_buf[i] = pvec_tem;
         }
 
+        // 删除旧数据
         for (int i = win_count - mgsize; i < win_count; i++)
         {
           x_buf.pop_back();
@@ -1807,17 +1951,17 @@ public:
           imu_pre_buf.pop_front();
         }
 
+        // 更新窗口参数
         win_base += mgsize;
         win_count -= mgsize;
       }
 
+      // 记录时间和内存使用
       double t_end = ros::Time::now().toSec();
       double mem = get_memory();
-      // printf("%d: %.4lf: %.4lf %.4lf %.4lf %.4lf %.4lf %.2lfGb %.1lf\n", win_base+win_count, t_end-t0, t1-t0, t2-t1, t3-t2, t5-t4, t6-t5, mem, jour);
-
-      // printf("%d: %lf %lf %lf\n", win_base + win_count, x_curr.p[0], x_curr.p[1], x_curr.p[2]);
     }
 
+    // 清理内存
     vector<OctoTree *> octos;
     for (auto iter = surf_map.begin(); iter != surf_map.end(); iter++)
     {
@@ -1836,61 +1980,82 @@ public:
     malloc_trim(0);
   }
 
-  // Build the pose graph in loop closure
+  // 构建位姿图用于回环检测
+  // initial: 初始位姿值
+  // graph: 非线性因子图
+  // cur_id: 当前地图ID
+  // lp_edges: 回环边集合
+  // default_noise: 默认噪声模型
+  // ids: 地图ID列表
+  // stepsizes: 每个地图的位姿数量累加和
+  // lpedge_enable: 是否启用回环边
   void build_graph(gtsam::Values &initial, gtsam::NonlinearFactorGraph &graph, int cur_id, PGO_Edges &lp_edges, gtsam::noiseModel::Diagonal::shared_ptr default_noise, vector<int> &ids, vector<int> &stepsizes, int lpedge_enable)
   {
+    // 清空初始值和因子图
     initial.clear();
     graph = gtsam::NonlinearFactorGraph();
     ids.clear();
+    // 连接当前地图ID到其他地图
     lp_edges.connect(cur_id, ids);
 
+    // 计算每个地图的位姿数量累加和
     stepsizes.clear();
     stepsizes.push_back(0);
     for (int i = 0; i < ids.size(); i++)
       stepsizes.push_back(stepsizes.back() + multimap_scanPoses[ids[i]]->size());
 
+    // 遍历所有地图
     for (int ii = 0; ii < ids.size(); ii++)
     {
       int bsize = stepsizes[ii], id = ids[ii];
+      // 遍历当前地图的所有位姿
       for (int j = bsize; j < stepsizes[ii + 1]; j++)
       {
+        // 获取当前位姿
         IMUST &xc = multimap_scanPoses[id]->at(j - bsize)->x;
+        // 将位姿转换为gtsam格式并插入初始值
         gtsam::Pose3 pose3(gtsam::Rot3(xc.R), gtsam::Point3(xc.p));
         initial.insert(j, pose3);
+        // 如果不是第一个位姿，添加相邻位姿间的边
         if (j > bsize)
         {
+          // 使用位姿的协方差作为噪声模型
           gtsam::Vector samv6(6);
           samv6 = multimap_scanPoses[ids[ii]]->at(j - 1 - bsize)->v6;
           gtsam::noiseModel::Diagonal::shared_ptr v6_noise = gtsam::noiseModel::Diagonal::Variances(samv6);
           add_edge(j - 1, j, multimap_scanPoses[id]->at(j - 1 - bsize)->x, multimap_scanPoses[id]->at(j - bsize)->x, graph, v6_noise);
-          // add_edge(j-1, j, multimap_scanPoses[id]->at(j-1-bsize)->x, multimap_scanPoses[id]->at(j-bsize)->x, graph, default_noise);
         }
       }
     }
 
+    // 为第一个地图添加先验约束
     if (multimap_scanPoses[ids[0]]->size() != 0)
     {
       int ceil = multimap_scanPoses[ids[0]]->size();
-      // if(ceil > 10) ceil = 10;
-      ceil = 1;
+      ceil = 1; // 只固定第一个位姿
       for (int i = 0; i < ceil; i++)
       {
+        // 使用很小的方差作为先验约束的噪声模型
         Eigen::Matrix<double, 6, 1> v6_fixd;
         v6_fixd << 1e-9, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9;
         gtsam::noiseModel::Diagonal::shared_ptr fixd_noise = gtsam::noiseModel::Diagonal::Variances(gtsam::Vector(v6_fixd));
+        // 获取固定位姿并添加到因子图中
         IMUST xf = multimap_scanPoses[ids[0]]->at(i)->x;
         gtsam::Pose3 pose3 = gtsam::Pose3(gtsam::Rot3(xf.R), gtsam::Point3(xf.p));
         graph.addPrior(i, pose3, fixd_noise);
       }
     }
 
+    // 如果启用回环边，添加回环约束
     if (lpedge_enable == 1)
       for (PGO_Edge &edge : lp_edges.edges)
       {
         vector<int> step(2);
+        // 检查回环边是否适用于当前地图集合
         if (edge.is_adapt(ids, step))
         {
           int mp[2] = {stepsizes[step[0]], stepsizes[step[1]]};
+          // 添加所有回环边
           for (int i = 0; i < edge.rots.size(); i++)
           {
             int id1 = mp[0] + edge.ids1[i];
@@ -1905,54 +2070,65 @@ public:
   // The topDownProcess of HBA is also run here
   void thd_loop_closure(ros::NodeHandle &n)
   {
+    // 初始化关键帧地图点云
     pl_kdmap.reset(new pcl::PointCloud<PointType>);
-    vector<STDescManager *> std_managers;
-    PGO_Edges lp_edges;
+    vector<STDescManager *> std_managers;  // ST描述子管理器列表
+    PGO_Edges lp_edges;  // 回环边集合
 
-    double jud_default = 0.45, icp_eigval = 14;
-    double ratio_drift = 0.05;
-    int curr_halt = 10, prev_halt = 30;
-    int isHighFly = 0;
+    // 初始化回环检测参数
+    double jud_default = 0.45, icp_eigval = 14;  // 回环判断阈值和ICP特征值阈值
+    double ratio_drift = 0.05;  // 漂移比例阈值
+    int curr_halt = 10, prev_halt = 30;  // 当前和之前会话的暂停阈值
+    int isHighFly = 0;  // 是否高空飞行标志
+    // 从ROS参数服务器读取回环检测参数
     n.param<double>("Loop/jud_default", jud_default, 0.45);
     n.param<double>("Loop/icp_eigval", icp_eigval, 14);
     n.param<double>("Loop/ratio_drift", ratio_drift, 0.05);
     n.param<int>("Loop/curr_halt", curr_halt, 10);
     n.param<int>("Loop/prev_halt", prev_halt, 30);
     n.param<int>("Loop/isHighFly", isHighFly, 0);
-    ConfigSetting config_setting;
+    ConfigSetting config_setting;  // 配置设置
     read_parameters(n, config_setting, isHighFly);
 
+    // 读取之前的地图会话信息
     vector<double> juds;
     FileReaderWriter::instance().previous_map_names(n, sessionNames, juds);
     FileReaderWriter::instance().pgo_edges_io(lp_edges, sessionNames, 0, savepath, bagname);
     FileReaderWriter::instance().previous_map_read(std_managers, multimap_scanPoses, multimap_keyframes, config_setting, lp_edges, n, sessionNames, juds, savepath, win_size);
 
+    // 初始化当前会话的ST描述子管理器
     STDescManager *std_manager = new STDescManager(config_setting);
     sessionNames.push_back(bagname);
     std_managers.push_back(std_manager);
     multimap_scanPoses.push_back(scanPoses);
     multimap_keyframes.push_back(keyframes);
     juds.push_back(jud_default);
-    vector<double> jours(std_managers.size(), 0);
+    vector<double> jours(std_managers.size(), 0);  // 记录每个会话的里程
 
+    // 初始化回环计数
     vector<int> relc_counts(std_managers.size(), prev_halt);
 
+    // 初始化局部缓冲区
     deque<ScanPose *> bl_local;
+    // 初始化位姿图优化参数
     Eigen::Matrix<double, 6, 1> v6_init, v6_fixd;
-    v6_init << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;
-    v6_fixd << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6;
+    v6_init << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;  // 初始协方差
+    v6_fixd << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6;  // 固定协方差
     gtsam::noiseModel::Diagonal::shared_ptr odom_noise = gtsam::noiseModel::Diagonal::Variances(gtsam::Vector(v6_init));
     gtsam::noiseModel::Diagonal::shared_ptr fixd_noise = gtsam::noiseModel::Diagonal::Variances(gtsam::Vector(v6_fixd));
-    gtsam::Values initial;
-    gtsam::NonlinearFactorGraph graph;
+    gtsam::Values initial;  // 初始位姿值
+    gtsam::NonlinearFactorGraph graph;  // 位姿图
 
+    // 初始化会话ID和步长
     vector<int> ids(1, std_managers.size() - 1), stepsizes(2, 0);
     pcl::PointCloud<pcl::PointXYZI>::Ptr plbtc(new pcl::PointCloud<pcl::PointXYZI>);
-    IMUST x_key;
-    int buf_base = 0;
+    IMUST x_key;  // 关键帧位姿
+    int buf_base = 0;  // 缓冲区基准索引
 
+    // 主循环
     while (n.ok())
     {
+      // 处理系统重置
       if (reset_flag == 1)
       {
         reset_flag = 0;
@@ -1992,16 +2168,20 @@ public:
         stepsizes.push_back(0);
       }
 
+      // 检查是否完成且缓冲区为空
       if (is_finish && buf_lba2loop.empty())
       {
         break;
       }
 
+      // 如果缓冲区为空或正在检测回环，则等待
       if (buf_lba2loop.empty() || loop_detect == 1)
       {
         sleep(0.01);
         continue;
       }
+
+      // 从缓冲区获取新的扫描位姿
       ScanPose *bl_head = nullptr;
       mtx_loop.lock();
       if (!buf_lba2loop.empty())
@@ -2013,6 +2193,7 @@ public:
       if (bl_head == nullptr)
         continue;
 
+      // 处理新的扫描位姿
       int cur_id = std_managers.size() - 1;
       scanPoses->push_back(bl_head);
       bl_local.push_back(bl_head);
@@ -2021,6 +2202,7 @@ public:
       int g_pos = stepsizes.back();
       initial.insert(g_pos, pose3);
 
+      // 添加位姿图边
       if (g_pos > 0)
       {
         gtsam::Vector samv6(scanPoses->at(buf_base - 1)->v6);
@@ -2033,11 +2215,13 @@ public:
         graph.addPrior(0, pose3, fixd_noise);
       }
 
+      // 更新关键帧信息
       if (buf_base == 0)
         x_key = xc;
       buf_base++;
       stepsizes.back() += 1;
 
+      // 检查是否需要创建新的关键帧
       if (bl_local.size() < win_size)
         continue;
       double ang = Log(x_key.R.transpose() * xc.R).norm() * 57.3;
@@ -2052,6 +2236,7 @@ public:
         jour += len;
       x_key = xc;
 
+      // 处理点云数据
       PVecPtr pptr(new PVec);
       for (int i = 0; i < win_size; i++)
       {
@@ -2070,11 +2255,13 @@ public:
         bl_local.pop_front();
       }
 
+      // 创建新的关键帧
       Keyframe *smp = new Keyframe(xc);
       smp->id = buf_base - 1;
       smp->jour = jours[cur_id];
       down_sampling_pvec(*pptr, voxel_size / 10, *(smp->plptr));
 
+      // 转换点云格式
       plbtc->clear();
       pcl::PointXYZI ap;
       for (pointVar &pv : *pptr)
@@ -2089,12 +2276,14 @@ public:
       keyframes->push_back(smp);
       mtx_keyframe.unlock();
 
+      // 生成ST描述子并进行回环检测
       vector<STD> stds_vec;
       std_manager->GenerateSTDescs(plbtc, stds_vec, buf_base - 1);
       pair<int, double> search_result(-1, 0);
       pair<Eigen::Vector3d, Eigen::Matrix3d> loop_transform;
       vector<pair<STD, STD>> loop_std_pair;
 
+      // 回环检测和优化
       bool isGraph = false, isOpt = false;
       int match_num = 0;
       for (int id = 0; id <= cur_id; id++)
@@ -2193,11 +2382,13 @@ public:
         it++;
       std_manager->AddSTDescs(stds_vec);
 
+      // 构建位姿图
       if (isGraph)
       {
         build_graph(initial, graph, cur_id, lp_edges, odom_noise, ids, stepsizes, 1);
       }
 
+      // 执行位姿图优化
       if (isOpt)
       {
         gtsam::ISAM2Params parameters;
@@ -2296,10 +2487,12 @@ public:
       }
     }
 
+    // 清理资源
     for (int i = 0; i < std_managers.size(); i++)
       delete std_managers[i];
     malloc_trim(0);
 
+    // 处理完成后的清理和保存
     if (is_finish)
     {
       if (keyframes->empty())
@@ -2325,6 +2518,7 @@ public:
       topDownProcess(initial, graph, ids, stepsizes);
     }
 
+    // 保存地图数据
     if (is_save_map)
     {
       for (int i = 0; i < ids.size(); i++)
@@ -2333,6 +2527,7 @@ public:
       FileReaderWriter::instance().pgo_edges_io(lp_edges, sessionNames, 1, savepath, bagname);
     }
 
+    // 清理内存
     for (int i = 0; i < multimap_scanPoses.size(); i++)
     {
       for (int j = 0; j < multimap_scanPoses[i]->size(); j++)
