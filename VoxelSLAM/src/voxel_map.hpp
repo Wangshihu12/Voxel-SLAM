@@ -1358,47 +1358,68 @@ public:
     }
   }
 
+  // 在八叉树节点中匹配点与平面
+  // 参数:
+  // wld - 待匹配点的世界坐标
+  // pla - 匹配到的平面指针
+  // max_prob - 最大匹配概率
+  // var_wld - 点的协方差矩阵
+  // sigma_d - 匹配的不确定度
+  // oc - 匹配到的八叉树节点指针
+  // 返回值: 1表示匹配成功,0表示匹配失败
   int match(Eigen::Vector3d &wld, Plane *&pla, double &max_prob, Eigen::Matrix3d &var_wld, double &sigma_d, OctoTree *&oc)
   {
     int flag = 0;
-    if (octo_state == 0)
+    if (octo_state == 0) // 如果是叶子节点
     {
-      if (plane.is_plane)
+      if (plane.is_plane) // 如果节点包含平面特征
       {
+        // 计算点到平面的距离
         float dis_to_plane = fabs(plane.normal.dot(wld - plane.center));
+        // 计算点到平面中心的距离
         float dis_to_center = (plane.center - wld).squaredNorm();
+        // 计算点到平面的垂直距离
         float range_dis = (dis_to_center - dis_to_plane * dis_to_plane);
+        
+        // 判断点是否在平面的有效范围内(3倍标准差)
         if (range_dis <= 3 * 3 * plane.radius)
         {
+          // 计算雅可比矩阵
           Eigen::Matrix<double, 1, 6> J_nq;
           J_nq.block<1, 3>(0, 0) = wld - plane.center;
           J_nq.block<1, 3>(0, 3) = -plane.normal;
+          // 计算测量不确定度
           double sigma_l = J_nq * plane.plane_var * J_nq.transpose();
           sigma_l += plane.normal.transpose() * var_wld * plane.normal;
+
+          // 如果点到平面的距离在3倍标准差内,认为匹配成功
           if (dis_to_plane < 3 * sqrt(sigma_l))
           {
+            // 注释掉的代码是计算匹配概率
             // float prob = 1 / (sqrt(sigma_l)) * exp(-0.5 * dis_to_plane * dis_to_plane / sigma_l);
             // if(prob > max_prob)
             {
-              oc = this;
-              sigma_d = sigma_l;
+              oc = this; // 记录匹配的节点
+              sigma_d = sigma_l; // 记录不确定度
               // max_prob = prob;
-              pla = &plane;
+              pla = &plane; // 记录匹配的平面
             }
 
-            flag = 1;
+            flag = 1; // 标记匹配成功
           }
         }
       }
     }
-    else
+    else // 如果是非叶子节点
     {
+      // 计算点所在的子节点编号
       int xyz[3] = {0, 0, 0};
       for (int k = 0; k < 3; k++)
         if (wld[k] > voxel_center[k])
           xyz[k] = 1;
       int leafnum = 4 * xyz[0] + 2 * xyz[1] + xyz[2];
 
+      // 注释掉的代码是遍历所有子节点进行匹配
       // for(int i=0; i<8; i++)
       // if(leaves[i] != nullptr)
       // {
@@ -1407,9 +1428,11 @@ public:
       //     flag = flg;
       // }
 
+      // 只在点所在的子节点中进行匹配
       if (leaves[leafnum] != nullptr)
         flag = leaves[leafnum]->match(wld, pla, max_prob, var_wld, sigma_d, oc);
 
+      // 注释掉的代码是另一种遍历方式
       // for(int i=0; i<8; i++)
       //   if(leaves[i] != nullptr)
       //     leaves[i]->match(pv, pla, max_prob, var_wld);
@@ -1700,20 +1723,27 @@ int match(unordered_map<VOXEL_LOC, OctoTree *> &feat_map, Eigen::Vector3d &wld, 
 {
   int flag = 0;
 
+  // 计算点所在的体素位置
   float loc[3];
   for (int j = 0; j < 3; j++)
   {
-    loc[j] = wld[j] / voxel_size;
+    loc[j] = wld[j] / voxel_size; // 将世界坐标除以体素大小得到体素坐标
     if (loc[j] < 0)
-      loc[j] -= 1;
+      loc[j] -= 1; // 负坐标需要向下取整
   }
+  
+  // 构造体素位置索引
   VOXEL_LOC position(loc[0], loc[1], loc[2]);
+  
+  // 在体素地图中查找对应位置的节点
   auto iter = feat_map.find(position);
   if (iter != feat_map.end())
   {
     double max_prob = 0;
+    // 在找到的体素节点中进行点与平面的匹配
     flag = iter->second->match(wld, pla, max_prob, var_wld, sigma_d, oc);
-    // iter->second->match_end(pv, pla, max_prob);
+    
+    // 如果匹配成功但平面指针为空,输出错误信息
     if (flag && pla == nullptr)
     {
       printf("pla null max_prob: %lf %ld %ld %ld\n", max_prob, iter->first.x, iter->first.y, iter->first.z);
