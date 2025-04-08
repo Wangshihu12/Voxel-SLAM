@@ -2042,7 +2042,8 @@ public:
         // 获取固定位姿并添加到因子图中
         IMUST xf = multimap_scanPoses[ids[0]]->at(i)->x;
         gtsam::Pose3 pose3 = gtsam::Pose3(gtsam::Rot3(xf.R), gtsam::Point3(xf.p));
-        graph.addPrior(i, pose3, fixd_noise);
+        // graph.addPrior(i, pose3, fixd_noise);
+        graph.add(gtsam::PriorFactor<gtsam::Pose3>(i, pose3, fixd_noise));
       }
     }
 
@@ -2231,7 +2232,8 @@ public:
       {
         // 添加先验约束固定第一个位姿
         gtsam::Pose3 pose3(gtsam::Rot3(xc.R), gtsam::Point3(xc.p));
-        graph.addPrior(0, pose3, fixd_noise);
+        // graph.addPrior(0, pose3, fixd_noise);
+        graph.add(gtsam::PriorFactor<gtsam::Pose3>(0, pose3, fixd_noise));
       }
 
       // 更新关键帧信息
