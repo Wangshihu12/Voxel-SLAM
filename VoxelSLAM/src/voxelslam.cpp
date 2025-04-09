@@ -466,23 +466,26 @@ public:
     return inst;
   }
 
+  // 重力对齐
   void align_gravity(vector<IMUST> &xs)
   {
-    Eigen::Vector3d g0 = xs[0].g;
-    Eigen::Vector3d n0 = g0 / g0.norm();
-    Eigen::Vector3d n1(0, 0, 1);
+    Eigen::Vector3d g0 = xs[0].g; // 获取第一个位姿的重力向量
+    Eigen::Vector3d n0 = g0 / g0.norm(); // 归一化重力向量，得到单位向量
+    Eigen::Vector3d n1(0, 0, 1); // 默认目标方向为Z轴正方向
+    // 如果初始重力向量Z分量为负，则将目标方向Z分量设为-1
     if (n0[2] < 0)
       n1[2] = -1;
 
-    Eigen::Vector3d rotvec = n0.cross(n1);
-    double rnorm = rotvec.norm();
-    rotvec = rotvec / rnorm;
+    Eigen::Vector3d rotvec = n0.cross(n1); // 计算两个方向的叉积，得到旋转轴
+    double rnorm = rotvec.norm(); // 计算叉积向量的模长
+    rotvec = rotvec / rnorm; // 归一化旋转轴向量
 
-    Eigen::AngleAxisd angaxis(asin(rnorm), rotvec);
-    Eigen::Matrix3d rot = angaxis.matrix();
-    g0 = rot * g0;
+    Eigen::AngleAxisd angaxis(asin(rnorm), rotvec); // 创建角轴表示的旋转
+    Eigen::Matrix3d rot = angaxis.matrix(); // 转换为旋转矩阵
+    g0 = rot * g0; // 应用旋转到初始重力向量，验证结果
 
-    Eigen::Vector3d p0 = xs[0].p;
+    Eigen::Vector3d p0 = xs[0].p; // 获取第一个位姿的位置作为参考点
+    // 遍历所有位姿，应用旋转矩阵和重力向量
     for (int i = 0; i < xs.size(); i++)
     {
       xs[i].p = rot * (xs[i].p - p0) + p0;
@@ -492,44 +495,57 @@ public:
     }
   }
 
+  // 处理激光雷达点云的运动畸变
+  // pl: 输入点云数据，包含原始激光雷达点
+  // pvec: 输出点云数据，存储去畸变后的点云
+  // xc: 当前帧位姿
+  // xl: 上一帧位姿
+  // imus: IMU数据队列，用于插值位姿
+  // pcl_beg_time: 点云开始时间
+  // extrin_para: 激光雷达与IMU间的外参
   void motion_blur(pcl::PointCloud<PointType> &pl, PVec &pvec, IMUST xc, IMUST xl, deque<sensor_msgs::Imu::Ptr> &imus, double pcl_beg_time, IMUST &extrin_para)
   {
-    xc.bg = xl.bg;
-    xc.ba = xl.ba;
-    Eigen::Vector3d acc_imu, angvel_avr, acc_avr, vel_imu(xc.v), pos_imu(xc.p);
-    Eigen::Matrix3d R_imu(xc.R);
-    vector<IMUST> imu_poses;
+    xc.bg = xl.bg; // 复制陀螺仪偏置
+    xc.ba = xl.ba; // 复制加速度计偏置
+    Eigen::Vector3d acc_imu, angvel_avr, acc_avr, vel_imu(xc.v), pos_imu(xc.p); // 初始化变量
+    Eigen::Matrix3d R_imu(xc.R); // 初始化旋转矩阵
+    vector<IMUST> imu_poses; // 存储插值位姿
 
     for (auto it_imu = imus.end() - 1; it_imu != imus.begin(); it_imu--)
     {
-      sensor_msgs::Imu &head = **(it_imu - 1);
-      sensor_msgs::Imu &tail = **(it_imu);
+      sensor_msgs::Imu &head = **(it_imu - 1); // 前一个IMU数据
+      sensor_msgs::Imu &tail = **(it_imu); // 当前IMU数据
 
+      // 计算角速度平均值（两个IMU数据的平均）
       angvel_avr << 0.5 * (head.angular_velocity.x + tail.angular_velocity.x),
           0.5 * (head.angular_velocity.y + tail.angular_velocity.y),
           0.5 * (head.angular_velocity.z + tail.angular_velocity.z);
+      // 计算加速度平均值
       acc_avr << 0.5 * (head.linear_acceleration.x + tail.linear_acceleration.x),
           0.5 * (head.linear_acceleration.y + tail.linear_acceleration.y),
           0.5 * (head.linear_acceleration.z + tail.linear_acceleration.z);
 
-      angvel_avr -= xc.bg;
-      acc_avr = acc_avr * imupre_scale_gravity - xc.ba;
+      angvel_avr -= xc.bg; // 减去陀螺仪偏置
+      acc_avr = acc_avr * imupre_scale_gravity - xc.ba; // 缩放加速度并减去加速度计偏置
 
-      double dt = head.header.stamp.toSec() - tail.header.stamp.toSec();
-      Eigen::Matrix3d acc_avr_skew = hat(acc_avr);
-      Eigen::Matrix3d Exp_f = Exp(angvel_avr, dt);
+      double dt = head.header.stamp.toSec() - tail.header.stamp.toSec(); // 计算时间差
+      Eigen::Matrix3d acc_avr_skew = hat(acc_avr); // 计算加速度的反对称矩阵（未使用）
+      Eigen::Matrix3d Exp_f = Exp(angvel_avr, dt); // 计算角速度的指数映射（旋转增量）
 
-      acc_imu = R_imu * acc_avr + xc.g;
-      pos_imu = pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt;
-      vel_imu = vel_imu + acc_imu * dt;
-      R_imu = R_imu * Exp_f;
+      // 计算当前IMU位姿
+      acc_imu = R_imu * acc_avr + xc.g; // 应用旋转矩阵和重力向量
+      pos_imu = pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt; // 更新位置
+      vel_imu = vel_imu + acc_imu * dt; // 更新速度
+      R_imu = R_imu * Exp_f; // 更新旋转矩阵
 
-      double offt = head.header.stamp.toSec() - pcl_beg_time;
-      imu_poses.emplace_back(offt, R_imu, pos_imu, vel_imu, angvel_avr, acc_imu);
+      // 计算时间偏移并存储位姿
+      double offt = head.header.stamp.toSec() - pcl_beg_time; // 相对点云开始时间的时间偏移
+      imu_poses.emplace_back(offt, R_imu, pos_imu, vel_imu, angvel_avr, acc_imu); // 存储IMU位姿
     }
 
-    pointVar pv;
-    pv.var.setIdentity();
+    pointVar pv; // 点变量结构
+    pv.var.setIdentity(); // 设置方差矩阵为单位矩阵
+    // 如果点没有时间戳，直接使用外参变换
     if (point_notime)
     {
       for (PointType &ap : pl.points)
@@ -540,143 +556,201 @@ public:
       }
       return;
     }
-    auto it_pcl = pl.end() - 1;
+
+    // 点云畸变处理
+    auto it_pcl = pl.end() - 1; // 从点云末尾开始处理
+    // 遍历所有插值位姿
     // for(auto it_kp=imu_poses.end(); it_kp!=imu_poses.begin(); it_kp--)
     for (auto it_kp = imu_poses.begin(); it_kp != imu_poses.end(); it_kp++)
     {
       // IMUST &head = *(it_kp - 1);
-      IMUST &head = *it_kp;
+      IMUST &head = *it_kp; // 获取当前插值位姿
+      // 提取位姿状态
       R_imu = head.R;
       acc_imu = head.ba;
       vel_imu = head.v;
       pos_imu = head.p;
       angvel_avr = head.bg;
 
+      // 处理时间戳在当前位姿时间范围内的点
       for (; it_pcl->curvature > head.t; it_pcl--)
       {
-        double dt = it_pcl->curvature - head.t;
+        double dt = it_pcl->curvature - head.t; // 点与当前位姿的时间差
+
+        // 插值计算点采集时刻的位姿
         Eigen::Matrix3d R_i = R_imu * Exp(angvel_avr, dt);
+        // 计算位移差：位置+速度×时间+0.5×加速度×时间²-当前位置
         Eigen::Vector3d T_ei = pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - xc.p;
 
+        // 获取原始点坐标
         Eigen::Vector3d P_i(it_pcl->x, it_pcl->y, it_pcl->z);
+        // 去畸变变换：先应用外参将点从激光雷达坐标系转到IMU坐标系，
+        // 再应用插值位姿转到世界坐标系，加上位移差，
+        // 最后转换到当前帧坐标系
         Eigen::Vector3d P_compensate = xc.R.transpose() * (R_i * (extrin_para.R * P_i + extrin_para.p) + T_ei);
 
+        // 存储去畸变后的点
         pv.pnt = P_compensate;
         pvec.push_back(pv);
+
+        // 如果点云处理完毕，则退出
         if (it_pcl == pl.begin())
           break;
       }
     }
   }
 
+  // pl_origs: 原始点云数据向量，包含滑动窗口内的多帧点云
+  // vec_imus: IMU数据队列的向量，每个滑动窗口帧对应一个IMU数据队列
+  // beg_times: 各帧点云的起始时间戳向量
+  // hess: 用于存储优化中的海森矩阵
+  // voxhess: 激光雷达因子对象，用于构建优化模型
+  // x_buf: 滑动窗口内的位姿向量
+  // surf_map: 表面特征的体素地图
+  // surf_map_slide: 滑动窗口中的体素地图
+  // pvec_buf: 处理后的点云数据向量
+  // win_size: 滑动窗口大小
+  // sws: 滑动窗口数据结构
+  // x_curr: 当前位姿，用于输出结果
+  // imu_pre_buf: IMU预积分数据队列
+  // extrin_para: 激光雷达与IMU之间的外参
   int motion_init(vector<pcl::PointCloud<PointType>::Ptr> &pl_origs, vector<deque<sensor_msgs::Imu::Ptr>> &vec_imus, vector<double> &beg_times, Eigen::MatrixXd *hess, LidarFactor &voxhess, vector<IMUST> &x_buf, unordered_map<VOXEL_LOC, OctoTree *> &surf_map, unordered_map<VOXEL_LOC, OctoTree *> &surf_map_slide, vector<PVecPtr> &pvec_buf, int win_size, vector<vector<SlideWindow *>> &sws, IMUST &x_curr, deque<IMU_PRE *> &imu_pre_buf, IMUST &extrin_para)
   {
-    PLV(3)
-    pwld;
-    double last_g_norm = x_buf[0].g.norm();
-    int converge_flag = 0;
+    PLV(3) pwld; // 在世界坐标系下的点向量
+    double last_g_norm = x_buf[0].g.norm(); // 初始重力向量的模长
+    int converge_flag = 0; // 收敛标志，0表示未收敛，1表示已收敛
 
-    double min_eigen_value_orig = min_eigen_value;
-    vector<double> eigen_value_array_orig = plane_eigen_value_thre;
+    // 保存原始参数
+    double min_eigen_value_orig = min_eigen_value; // 保存原始最小特征值
+    vector<double> eigen_value_array_orig = plane_eigen_value_thre; // 保存原始平面特征值阈值
 
-    min_eigen_value = 0.02;
+    // 设置初始化阶段特殊的参数值
+    min_eigen_value = 0.02; // 设置较宽松的特征值阈值
     for (double &iter : plane_eigen_value_thre)
-      iter = 1.0 / 4;
+      iter = 1.0 / 4; // 缩小平面特征值阈值
 
-    double t0 = ros::Time::now().toSec();
-    double converge_thre = 0.05;
-    int converge_times = 0;
-    bool is_degrade = true;
-    Eigen::Vector3d eigvalue;
-    eigvalue.setZero();
+    double t0 = ros::Time::now().toSec(); // 记录开始时间
+    double converge_thre = 0.05; // 收敛阈值
+    int converge_times = 0; // 收敛次数计数
+    bool is_degrade = true; // 是否存在退化情况，初始假设为真
+    Eigen::Vector3d eigvalue; // 特征值向量
+    eigvalue.setZero(); // 初始化为零
+
+    // 迭代优化
     for (int iterCnt = 0; iterCnt < 10; iterCnt++)
     {
+      // 如果达到第一次收敛，恢复原始参数值进行更精确的优化
       if (converge_flag == 1)
       {
         min_eigen_value = min_eigen_value_orig;
         plane_eigen_value_thre = eigen_value_array_orig;
       }
 
+      // 清理之前的体素地图
       vector<OctoTree *> octos;
       for (auto iter = surf_map.begin(); iter != surf_map.end(); ++iter)
       {
-        iter->second->tras_ptr(octos);
-        iter->second->clear_slwd(sws[0]);
-        delete iter->second;
+        iter->second->tras_ptr(octos); // 转移指针到临时向量
+        iter->second->clear_slwd(sws[0]); // 清除滑动窗口关联
+        delete iter->second; // 删除八叉树节点
       }
       for (int i = 0; i < octos.size(); i++)
-        delete octos[i];
-      surf_map.clear();
-      octos.clear();
-      surf_map_slide.clear();
+        delete octos[i]; // 删除临时向量中的节点
+      surf_map.clear(); // 清空地图
+      octos.clear(); // 清空临时向量
+      surf_map_slide.clear(); // 清空滑动窗口地图
 
+      // 处理每一帧点云数据
       for (int i = 0; i < win_size; i++)
       {
-        pwld.clear();
-        pvec_buf[i]->clear();
-        int l = i == 0 ? i : i - 1;
+        pwld.clear(); // 清空世界坐标点向量
+        pvec_buf[i]->clear(); // 清空点云缓冲区
+        int l = i == 0 ? i : i - 1; // 获取前一帧索引，第一帧使用自身
+
+        // 对点云进行运动畸变补偿
         motion_blur(*pl_origs[i], *pvec_buf[i], x_buf[i], x_buf[l], vec_imus[i], beg_times[i], extrin_para);
 
+        // 如果已经达到第一次收敛
         if (converge_flag == 1)
         {
+          // 计算每个点的协方差矩阵，考虑测量不确定性
           for (pointVar &pv : *pvec_buf[i])
             calcBodyVar(pv.pnt, dept_err, beam_err, pv.var);
+          // 更新点云缓冲区
           pvec_update(pvec_buf[i], x_buf[i], pwld);
         }
-        else
+        else // 未收敛阶段
         {
+          // 将点云转换到世界坐标系
           for (pointVar &pv : *pvec_buf[i])
             pwld.push_back(x_buf[i].R * pv.pnt + x_buf[i].p);
         }
 
+        // 将点云切分到体素地图中
         cut_voxel(surf_map, pvec_buf[i], i, surf_map_slide, win_size, pwld, sws[0]);
       }
 
+      // 清理并重新设置激光雷达因子
       // LidarFactor voxhess(win_size);
       voxhess.clear();
       voxhess.win_size = win_size;
+
+      // 遍历体素地图，提取特征并构建优化约束
       for (auto iter = surf_map.begin(); iter != surf_map.end(); ++iter)
       {
-        iter->second->recut(win_size, x_buf, sws[0]);
-        iter->second->tras_opt(voxhess);
+        iter->second->recut(win_size, x_buf, sws[0]); // 重新切分体素
+        iter->second->tras_opt(voxhess); // 提取优化约束
       }
 
+      // 如果特征点太少，跳出优化
       if (voxhess.plvec_voxels.size() < 10)
         break;
+
+      // 创建带重力优化的求解器
       LI_BA_OptimizerGravity opt_lsv;
-      vector<double> resis;
+      vector<double> resis; // 残差向量
+      // 进行带阻尼的迭代优化
       opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, hess, 3);
-      Eigen::Matrix3d nnt;
+      Eigen::Matrix3d nnt; // 协方差矩阵
       nnt.setZero();
 
+      // 打印当前迭代的重力向量和收敛情况
       printf("%d: %lf %lf %lf: %lf %lf\n", iterCnt, x_buf[0].g[0], x_buf[0].g[1], x_buf[0].g[2], x_buf[0].g.norm(), fabs(resis[0] - resis[1]) / resis[0]);
 
+      // 清理旧的IMU预积分数据
       for (int i = 0; i < win_size - 1; i++)
         delete imu_pre_buf[i];
       imu_pre_buf.clear();
 
+      // 重新计算IMU预积分
       for (int i = 1; i < win_size; i++)
       {
         imu_pre_buf.push_back(new IMU_PRE(x_buf[i - 1].bg, x_buf[i - 1].ba));
         imu_pre_buf.back()->push_imu(vec_imus[i]);
       }
 
+      // 如果残差变化小于收敛阈值且迭代次数大于等于2，
+      // 则计算特征值并更新收敛标志
       if (fabs(resis[0] - resis[1]) / resis[0] < converge_thre && iterCnt >= 2)
       {
+        // 计算特征向量的协方差矩阵，用于检测退化情况
         for (Eigen::Matrix3d &iter : voxhess.eig_vectors)
         {
-          Eigen::Vector3d v3 = iter.col(0);
-          nnt += v3 * v3.transpose();
+          Eigen::Vector3d v3 = iter.col(0); // 取第一个特征向量（法向量）
+          nnt += v3 * v3.transpose(); // 累加外积
         }
+        // 计算协方差矩阵的特征值
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(nnt);
         eigvalue = saes.eigenvalues();
+        // 如果最小特征值小于15，认为存在退化
         is_degrade = eigvalue[0] < 15 ? true : false;
 
+        // 降低收敛阈值，收敛判断更严格
         converge_thre = 0.01;
         if (converge_flag == 0)
         {
-          align_gravity(x_buf);
-          converge_flag = 1;
+          align_gravity(x_buf); // 对齐重力方向
+          converge_flag = 1; // 设置收敛标志
           continue;
         }
         else
@@ -684,12 +758,17 @@ public:
       }
     }
 
+    // 更新当前位姿为滑动窗口中的最后一个位姿
     x_curr = x_buf[win_size - 1];
-    double gnm = x_curr.g.norm();
+    double gnm = x_curr.g.norm(); // 计算重力向量模长
+
+    // 检查是否存在退化情况或重力向量异常
     if (is_degrade || gnm < 9.6 || gnm > 10.0)
     {
-      converge_flag = 0;
+      converge_flag = 0; // 设置未收敛标志
     }
+
+    // 如果未收敛，清理地图
     if (converge_flag == 0)
     {
       vector<OctoTree *> octos;
@@ -706,17 +785,22 @@ public:
       surf_map_slide.clear();
     }
 
+    // 打印特征值和IMU数据
     printf("mn: %lf %lf %lf\n", eigvalue[0], eigvalue[1], eigvalue[2]);
     Eigen::Vector3d angv(vec_imus[0][0]->angular_velocity.x, vec_imus[0][0]->angular_velocity.y, vec_imus[0][0]->angular_velocity.z);
     Eigen::Vector3d acc(vec_imus[0][0]->linear_acceleration.x, vec_imus[0][0]->linear_acceleration.y, vec_imus[0][0]->linear_acceleration.z);
     acc *= 9.8;
 
+    // 清理临时数据
     pl_origs.clear();
     vec_imus.clear();
     beg_times.clear();
+
+    // 计算和打印初始化时间
     double t1 = ros::Time::now().toSec();
     printf("init time: %lf\n", t1 - t0);
 
+    // 可视化初始化结果
     // align_gravity(x_buf);
     pcl::PointCloud<PointType> pcl_send;
     PointType pt;
@@ -729,9 +813,9 @@ public:
         pt.z = vv[2];
         pcl_send.push_back(pt);
       }
-    pub_pl_func(pcl_send, pub_init);
+    pub_pl_func(pcl_send, pub_init); // 发布点云用于可视化
 
-    return converge_flag;
+    return converge_flag; // 返回收敛状态
   }
 };
 
@@ -1774,6 +1858,7 @@ public:
         if (init == 1)
         {
           motion_init_flag = 0;
+          std::cout << "动态初始化成功" << std::endl;
         }
         else
         {
@@ -1874,6 +1959,7 @@ public:
           vector<double> resis;
           opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, &hess, 5);
           printf("g update: %lf %lf %lf: %lf\n", x_buf[0].g[0], x_buf[0].g[1], x_buf[0].g[2], x_buf[0].g.norm());
+          std::cout << "带重力更新的局部 BA 优化" << std::endl;
           g_update = 0;
           x_curr.g = x_buf[win_count - 1].g;
         }

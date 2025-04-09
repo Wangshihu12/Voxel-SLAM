@@ -12,22 +12,22 @@ class IMU_PRE
 {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  Eigen::Matrix3d R_delta;
-  Eigen::Vector3d p_delta, v_delta;
+  Eigen::Matrix3d R_delta; // 预积分的旋转矩阵，表示两个关键帧之间的相对旋转
+  Eigen::Vector3d p_delta, v_delta; // 预积分的位置向量，表示两个关键帧之间的相对位移
   Eigen::Vector3d bg, ba;
 
-  Eigen::Matrix3d R_bg;
-  Eigen::Matrix3d p_bg, p_ba;
-  Eigen::Matrix3d v_bg, v_ba;
+  Eigen::Matrix3d R_bg; // 旋转预积分值对陀螺仪偏置的雅可比矩阵，∂R_delta/∂bg
+  Eigen::Matrix3d p_bg, p_ba; // 位置预积分值对陀螺仪和加速度计偏置的雅可比矩阵
+  Eigen::Matrix3d v_bg, v_ba; // 速度预积分值对陀螺仪和加速度计偏置的雅可比矩阵
 
-  double dtime;
+  double dtime; // 预积分的总时间间隔
 
-  Eigen::Vector3d dbg, dba;
-  Eigen::Vector3d dbg_buf, dba_buf;
+  Eigen::Vector3d dbg, dba; // 陀螺仪和加速度计偏置的当前增量，用于重参数化
+  Eigen::Vector3d dbg_buf, dba_buf; // 偏置增量的缓存，用于优化迭代中可能的回滚
 
-  Eigen::Matrix<double, DIM, DIM> cov;
+  Eigen::Matrix<double, DIM, DIM> cov; // 预积分噪声的协方差矩阵，表示测量不确定性
 
-  deque<sensor_msgs::ImuPtr> _imus;
+  deque<sensor_msgs::ImuPtr> _imus; // 存储两个关键帧之间原始IMU数据的双端队列
 
   IMU_PRE(const Eigen::Vector3d &bg1 = Eigen::Vector3d::Zero(), const Eigen::Vector3d &ba1 = Eigen::Vector3d::Zero())
   {
