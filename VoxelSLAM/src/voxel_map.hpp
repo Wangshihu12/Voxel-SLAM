@@ -11,10 +11,25 @@
 #include <ros/ros.h>
 #include <fstream>
 
+/**
+ * 带协方差矩阵的三维点结构体
+ * 该结构体存储3D点的位置及其不确定性信息，是体素SLAM系统中的基本数据单元
+ */
 struct pointVar
 {
+  // 确保内存对齐，优化Eigen对象的性能
+  // 这宏确保结构体的对象在内存中正确对齐，避免非对齐内存访问导致的性能下降
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  
+  // 点的三维坐标
+  // 使用Eigen库的Vector3d类型表示(x,y,z)坐标
+  // 在体素SLAM中用于存储点的空间位置信息
   Eigen::Vector3d pnt;
+  
+  // 点的协方差矩阵
+  // 3x3矩阵表示点在三个维度上的不确定性和相关性
+  // 对角线元素表示x/y/z方向的方差，非对角线元素表示维度间的协方差
+  // 在基于概率的SLAM系统中用于表示点位置的不确定性，影响优化权重
   Eigen::Matrix3d var;
 };
 
@@ -1033,113 +1048,190 @@ class OctoTree
 {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  SlideWindow *sw = nullptr;
-  PointCluster pcr_add;
-  Eigen::Matrix<double, 9, 9> cov_add;
+  SlideWindow *sw = nullptr; // 滑动窗口指针,用于存储时间窗口内的点云数据
+  PointCluster pcr_add; // 当前节点中添加的点云的集合统计
+  Eigen::Matrix<double, 9, 9> cov_add; // 协方差矩阵(9x9),用于平面参数估计
 
-  PointCluster pcr_fix;
-  PVec point_fix;
+  PointCluster pcr_fix; // 固定点云的集合统计,不随位姿优化变化
+  PVec point_fix; // 固定点的向量,包含点和协方差
 
-  int layer, octo_state, wdsize;
-  OctoTree *leaves[8];
-  double voxel_center[3];
-  double jour = 0;
-  float quater_length;
+  // 当前节点在八叉树中的层级
+  int layer;
+  // 八叉树节点状态:0表示叶子节点,1表示内部节点
+  int octo_state;
+  // 滑动窗口大小
+  int wdsize;
+  OctoTree *leaves[8]; // 八个子节点指针数组
+  double voxel_center[3]; // 体素中心坐标
+  double jour = 0; // 时间戳或序号,用于跟踪节点的创建时间
+  float quater_length; // 体素的四分之一边长
 
-  Plane plane;
-  bool isexist = false;
+  Plane plane; // 节点中提取的平面特征
+  bool isexist = false; // 节点是否存在有效数据
 
-  Eigen::Vector3d eig_value;
-  Eigen::Matrix3d eig_vector;
+  Eigen::Vector3d eig_value; // 特征值(用于平面判断)
+  Eigen::Matrix3d eig_vector; // 特征向量(平面的法向量在第一列)
 
-  int last_num = 0, opt_state = -1;
+  // 上次更新时的点数
+  int last_num = 0;
+  // 优化状态标志,-1表示未参与优化
+  int opt_state = -1;
   mutex mVox;
 
+  /**
+   * 八叉树节点构造函数
+   * @param _l 当前节点的层级
+   * @param _w 滑动窗口大小
+   */
   OctoTree(int _l, int _w) : layer(_l), wdsize(_w), octo_state(0)
   {
+    // 初始化所有子节点指针为空
     for (int i = 0; i < 8; i++)
       leaves[i] = nullptr;
+    // 初始化协方差矩阵为零矩阵
     cov_add.setZero();
 
+    // 注释掉的代码: 曾用于生成随机颜色或标识值
     // ins = 255.0*rand()/(RAND_MAX + 1.0f);
   }
 
+  /**
+   * 将点添加到八叉树节点中的内联函数
+   * @param ord 点在原始序列中的索引
+   * @param pv 点的数据结构,包含位置和协方差
+   * @param pw 点在世界坐标系中的位置
+   * @param sws 可重用的滑动窗口指针列表
+   */
   inline void push(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow *> &sws)
   {
+    // 加锁以保护多线程访问
     mVox.lock();
+    // 如果当前节点没有滑动窗口,则创建或重用一个
     if (sw == nullptr)
     {
       if (sws.size() != 0)
       {
+        // 从池中获取一个滑动窗口
         sw = sws.back();
         sws.pop_back();
+        // 调整滑动窗口大小与当前节点匹配
         sw->resize(wdsize);
       }
       else
+        // 没有可用的滑动窗口,创建一个新的
         sw = new SlideWindow(wdsize);
     }
+    // 标记节点为有效数据
     if (!isexist)
       isexist = true;
 
+    // 获取在映射数组中的索引
     int mord = mp[ord];
+    // 如果节点层级小于最大层级,存储原始点数据
     if (layer < max_layer)
       sw->points[mord].push_back(pv);
+    // 在滑动窗口中添加点的局部坐标
     sw->pcrs_local[mord].push(pv.pnt);
+    // 在当前节点累积世界坐标系中的点
     pcr_add.push(pw);
+    // 计算并累积协方差矩阵,用于平面拟合
     Eigen::Matrix<double, 9, 9> Bi;
     Bf_var(pv, Bi, pw);
     cov_add += Bi;
+    // 解锁
     mVox.unlock();
   }
 
+  /**
+   * 添加固定点到八叉树节点的内联函数
+   * @param pv 要添加的固定点数据结构(包含位置和协方差)
+   */
   inline void push_fix(pointVar &pv)
   {
+    // 如果节点层级小于最大层级,存储原始点
     if (layer < max_layer)
       point_fix.push_back(pv);
+    // 添加点到固定点云统计数据中
     pcr_fix.push(pv.pnt);
+    // 同时累加到节点的总点云统计中
     pcr_add.push(pv.pnt);
+    // 计算并累积协方差矩阵
     Eigen::Matrix<double, 9, 9> Bi;
     Bf_var(pv, Bi, pv.pnt);
     cov_add += Bi;
   }
 
+  /**
+   * 添加固定点到八叉树节点的内联函数(不计算协方差)
+   * @param pv 要添加的固定点数据结构
+   */
   inline void push_fix_novar(pointVar &pv)
   {
+    // 如果节点层级小于最大层级,存储原始点
     if (layer < max_layer)
       point_fix.push_back(pv);
+    // 添加点到固定点云统计数据中
     pcr_fix.push(pv.pnt);
+    // 同时累加到节点的总点云统计中
     pcr_add.push(pv.pnt);
+    // 注意: 与push_fix不同,这里不计算协方差矩阵
   }
 
+  /**
+   * 判断点集是否构成平面的内联函数
+   * @param eig_values 点云协方差矩阵的特征值(按升序排列)
+   * @return 如果满足平面条件返回true,否则返回false
+   */
   inline bool plane_judge(Eigen::Vector3d &eig_values)
   {
+    // 注释掉的简单判断: 仅检查最小特征值是否小于阈值
     // return (eig_values[0] < min_eigen_value);
+    
+    // 当前使用的判断条件:
+    // 1. 最小特征值小于阈值 且
+    // 2. 最小特征值与最大特征值的比值小于层级相关的阈值
+    // 这两个条件共同确保点云分布是扁平的(平面状)
     return (eig_values[0] < min_eigen_value && (eig_values[0] / eig_values[2]) < plane_eigen_value_thre[layer]);
   }
 
+  /**
+   * 将点分配到八叉树中合适位置的函数
+   * @param ord 点在原始序列中的索引
+   * @param pv 点的数据结构,包含位置和协方差
+   * @param pw 点在世界坐标系中的位置
+   * @param sws 可重用的滑动窗口指针列表
+   */
   void allocate(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow *> &sws)
   {
+    // 如果是叶子节点,直接添加点到当前节点
     if (octo_state == 0)
     {
       push(ord, pv, pw, sws);
     }
     else
     {
+      // 根据点的世界坐标相对于当前节点中心的位置确定子节点
       int xyz[3] = {0, 0, 0};
       for (int k = 0; k < 3; k++)
         if (pw[k] > voxel_center[k])
           xyz[k] = 1;
+      // 计算子节点索引(0-7)
       int leafnum = 4 * xyz[0] + 2 * xyz[1] + xyz[2];
 
+      // 如果对应的子节点不存在,创建一个新的
       if (leaves[leafnum] == nullptr)
       {
+        // 创建新的子节点,层级+1
         leaves[leafnum] = new OctoTree(layer + 1, wdsize);
+        // 计算子节点的中心坐标
         leaves[leafnum]->voxel_center[0] = voxel_center[0] + (2 * xyz[0] - 1) * quater_length;
         leaves[leafnum]->voxel_center[1] = voxel_center[1] + (2 * xyz[1] - 1) * quater_length;
         leaves[leafnum]->voxel_center[2] = voxel_center[2] + (2 * xyz[2] - 1) * quater_length;
+        // 子节点的四分之一长度是当前节点的一半
         leaves[leafnum]->quater_length = quater_length / 2;
       }
 
+      // 递归地将点分配到子节点中
       leaves[leafnum]->allocate(ord, pv, pw, sws);
     }
   }
@@ -1171,139 +1263,219 @@ public:
     }
   }
 
+  /**
+   * 将固定点集合划分并分配到八叉树子节点中
+   * @param sws 可重用的滑动窗口指针列表
+   */
   void fix_divide(vector<SlideWindow *> &sws)
   {
+    // 遍历当前节点中存储的所有固定点
     for (pointVar &pv : point_fix)
     {
+      // 根据点相对于当前节点中心的位置确定其所属的子节点
       int xyz[3] = {0, 0, 0};
       for (int k = 0; k < 3; k++)
         if (pv.pnt[k] > voxel_center[k])
           xyz[k] = 1;
+      // 计算子节点索引(0-7)
       int leafnum = 4 * xyz[0] + 2 * xyz[1] + xyz[2];
+      
+      // 如果对应的子节点不存在,创建一个新的
       if (leaves[leafnum] == nullptr)
       {
+        // 创建新的子节点,层级+1
         leaves[leafnum] = new OctoTree(layer + 1, wdsize);
+        // 计算子节点的中心坐标
         leaves[leafnum]->voxel_center[0] = voxel_center[0] + (2 * xyz[0] - 1) * quater_length;
         leaves[leafnum]->voxel_center[1] = voxel_center[1] + (2 * xyz[1] - 1) * quater_length;
         leaves[leafnum]->voxel_center[2] = voxel_center[2] + (2 * xyz[2] - 1) * quater_length;
+        // 子节点的四分之一长度是当前节点的一半
         leaves[leafnum]->quater_length = quater_length / 2;
       }
 
+      // 将固定点添加到对应的子节点中(使用带协方差计算的方式)
       leaves[leafnum]->push_fix(pv);
     }
   }
 
+  /**
+   * 将当前节点特定时间索引的点云重新分配到八叉树子节点中
+   * @param si 时间索引(在滑动窗口索引数组中的位置)
+   * @param xx IMU状态,包含位姿信息用于坐标变换
+   * @param sws 可重用的滑动窗口指针列表
+   */
   void subdivide(int si, IMUST &xx, vector<SlideWindow *> &sws)
   {
+    // 遍历当前节点中特定时间索引的所有点
     for (pointVar &pv : sw->points[mp[si]])
     {
+      // 将点从局部坐标转换到世界坐标系
       Eigen::Vector3d pw = xx.R * pv.pnt + xx.p;
+      // 根据点的世界坐标相对于当前节点中心的位置确定子节点
       int xyz[3] = {0, 0, 0};
       for (int k = 0; k < 3; k++)
         if (pw[k] > voxel_center[k])
           xyz[k] = 1;
+      // 计算子节点索引(0-7)
       int leafnum = 4 * xyz[0] + 2 * xyz[1] + xyz[2];
+      
+      // 如果对应的子节点不存在,创建一个新的
       if (leaves[leafnum] == nullptr)
       {
+        // 创建新的子节点,层级+1
         leaves[leafnum] = new OctoTree(layer + 1, wdsize);
+        // 计算子节点的中心坐标
         leaves[leafnum]->voxel_center[0] = voxel_center[0] + (2 * xyz[0] - 1) * quater_length;
         leaves[leafnum]->voxel_center[1] = voxel_center[1] + (2 * xyz[1] - 1) * quater_length;
         leaves[leafnum]->voxel_center[2] = voxel_center[2] + (2 * xyz[2] - 1) * quater_length;
+        // 子节点的四分之一长度是当前节点的一半
         leaves[leafnum]->quater_length = quater_length / 2;
       }
 
+      // 将点添加到对应的子节点中
       leaves[leafnum]->push(si, pv, pw, sws);
     }
   }
 
+  /**
+   * 更新平面参数及其协方差矩阵
+   * 该函数在检测到平面特征时调用,用于计算平面的精确参数和不确定性
+   */
   void plane_update()
   {
+    // 计算平面中心点(点云质心)
     plane.center = pcr_add.v / pcr_add.N;
+    // 使用最小特征值对应的特征向量作为平面法向量
     int l = 0;
+    // 提取所有特征向量构成正交基底
     Eigen::Vector3d u[3] = {eig_vector.col(0), eig_vector.col(1), eig_vector.col(2)};
+    // 点数的倒数,用于归一化
     double nv = 1.0 / pcr_add.N;
 
+    // 计算特征向量对协方差的导数
     Eigen::Matrix<double, 3, 9> u_c;
     u_c.setZero();
     for (int k = 0; k < 3; k++)
-      if (k != l)
+      if (k != l) // 对非法向量方向的特征向量
       {
+        // 计算外积矩阵
         Eigen::Matrix3d ukl = u[k] * u[l].transpose();
+        // 构建平面参数雅可比矩阵的一部分
         Eigen::Matrix<double, 1, 9> fkl;
         fkl.head(6) << ukl(0, 0), ukl(1, 0) + ukl(0, 1), ukl(2, 0) + ukl(0, 2),
             ukl(1, 1), ukl(1, 2) + ukl(2, 1), ukl(2, 2);
+        // 计算与平面中心相关的部分
         fkl.tail(3) = -(u[k].dot(plane.center) * u[l] + u[l].dot(plane.center) * u[k]);
 
+        // 累加每个非法向量方向的贡献,加权系数与特征值差异相关
         u_c += nv / (eig_value[l] - eig_value[k]) * u[k] * fkl;
       }
 
+    // 计算平面参数协方差传播
     Eigen::Matrix<double, 3, 9> Jc = u_c * cov_add;
+    // 法向量协方差
     plane.plane_var.block<3, 3>(0, 0) = Jc * u_c.transpose();
+    // 法向量与中心点的协方差
     Eigen::Matrix3d Jc_N = nv * Jc.block<3, 3>(0, 6);
     plane.plane_var.block<3, 3>(0, 3) = Jc_N;
     plane.plane_var.block<3, 3>(3, 0) = Jc_N.transpose();
+    // 中心点的协方差
     plane.plane_var.block<3, 3>(3, 3) = nv * nv * cov_add.block<3, 3>(6, 6);
+    // 设置平面法向量为第一个特征向量(对应最小特征值)
     plane.normal = u[0];
+    // 平面的半径用最大特征值表示(表示点云在平面内的展布程度)
     plane.radius = eig_value[2];
   }
 
+  /**
+   * 重新划分八叉树节点,基于点云分布特性决定是否需要细分
+   * @param win_count 滑动窗口中的帧数
+   * @param x_buf 存储各帧位姿的IMU状态缓冲区
+   * @param sws 可重用的滑动窗口指针列表
+   */
   void recut(int win_count, vector<IMUST> &x_buf, vector<SlideWindow *> &sws)
   {
+    // 处理叶子节点
     if (octo_state == 0)
     {
-      if (layer >= 0)
+      if (layer >= 0) // 忽略负层级(根节点上层)
       {
+        // 重置优化状态标志
         opt_state = -1;
+        // 如果点数太少,则不是平面
         if (pcr_add.N <= min_point[layer])
         {
           plane.is_plane = false;
           return;
         }
+        // 如果节点无效或没有滑动窗口,直接返回
         if (!isexist || sw == nullptr)
           return;
 
+        // 计算点云协方差矩阵的特征值和特征向量
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(pcr_add.cov());
         eig_value = saes.eigenvalues();
         eig_vector = saes.eigenvectors();
+        // 判断是否满足平面条件
         plane.is_plane = plane_judge(eig_value);
 
+        // 如果是平面特征,不需要进一步细分
         if (plane.is_plane)
         {
           return;
         }
+        // 如果已达最大层级,也不再细分
         else if (layer >= max_layer)
           return;
       }
 
+      // 处理固定点,将它们分配到子节点
       if (pcr_fix.N != 0)
       {
         fix_divide(sws);
-        // point_fix.clear();
+        // 释放固定点数组内存(使用swap而不是clear以确保内存被释放)
         PVec().swap(point_fix);
       }
 
+      // 将滑动窗口中每一帧的点云重新分配到子节点
       for (int i = 0; i < win_count; i++)
         subdivide(i, x_buf[i], sws);
 
+      // 清空滑动窗口并将其回收到池中
       sw->clear();
       sws.push_back(sw);
       sw = nullptr;
+      // 将当前节点状态改为内部节点
       octo_state = 1;
     }
 
+    // 对所有非空子节点递归调用recut
     for (int i = 0; i < 8; i++)
       if (leaves[i] != nullptr)
         leaves[i]->recut(win_count, x_buf, sws);
   }
 
+  /**
+   * 执行滑动窗口边缘化操作,将早期帧点云转换为固定点云
+   * @param win_count 滑动窗口中的总帧数
+   * @param mgsize 要边缘化的帧数(窗口中最早的几帧)
+   * @param x_buf 存储各帧位姿的IMU状态缓冲区
+   * @param vox_opt 优化后的LiDAR因子,包含优化后的点云统计信息
+   */
   void margi(int win_count, int mgsize, vector<IMUST> &x_buf, const LidarFactor &vox_opt)
   {
+    // 处理叶子节点且非根节点
     if (octo_state == 0 && layer >= 0)
     {
+      // 如果节点无效或没有滑动窗口,直接返回
       if (!isexist || sw == nullptr)
         return;
+      // 加锁以保护多线程访问
       mVox.lock();
+      // 创建临时数组存储转换到世界坐标系的点云
       vector<PointCluster> pcrs_world(wdsize);
+      
+      // 注释掉的代码: 直接累加世界坐标系下的点,现在通过优化后的结果处理
       // pcr_add = pcr_fix;
       // for(int i=0; i<win_count; i++)
       // if(sw->pcrs_local[mp[i]].N != 0)
@@ -1312,28 +1484,34 @@ public:
       //   pcr_add += pcrs_world[i];
       // }
 
+      // 检查优化状态索引是否有效
       if (opt_state >= int(vox_opt.pcr_adds.size()))
       {
         printf("Error: opt_state: %d %zu\n", opt_state, vox_opt.pcr_adds.size());
         exit(0);
       }
 
+      // 如果节点参与了优化,使用优化后的结果
       if (opt_state >= 0)
       {
+        // 从优化结果中获取点云统计、特征值和特征向量
         pcr_add = vox_opt.pcr_adds[opt_state];
         eig_value = vox_opt.eig_values[opt_state];
         eig_vector = vox_opt.eig_vectors[opt_state];
         opt_state = -1;
 
+        // 仅转换要边缘化的帧,但不累加到pcr_add中
         for (int i = 0; i < mgsize; i++)
           if (sw->pcrs_local[mp[i]].N != 0)
           {
             pcrs_world[i].transform(sw->pcrs_local[mp[i]], x_buf[i]);
           }
       }
-      else
+      else // 节点未参与优化,需要重新计算
       {
+        // 从固定点云开始累加
         pcr_add = pcr_fix;
+        // 转换滑动窗口中所有帧的点云到世界坐标系并累加
         for (int i = 0; i < win_count; i++)
           if (sw->pcrs_local[mp[i]].N != 0)
           {
@@ -1341,6 +1519,7 @@ public:
             pcr_add += pcrs_world[i];
           }
 
+        // 如果是平面特征,重新计算特征值和特征向量
         if (plane.is_plane)
         {
           Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(pcr_add.cov());
@@ -1349,19 +1528,24 @@ public:
         }
       }
 
+      // 如果固定点数量未达到上限且是平面特征,考虑更新平面参数
       if (pcr_fix.N < max_points && plane.is_plane)
+        // 当点数增加较多或初始点数较少时更新平面参数
         if (pcr_add.N - last_num >= 5 || last_num <= 10)
         {
           plane_update();
           last_num = pcr_add.N;
         }
 
+      // 如果固定点数量未达到上限,将边缘化的点添加到固定点中
       if (pcr_fix.N < max_points)
       {
         for (int i = 0; i < mgsize; i++)
           if (pcrs_world[i].N != 0)
           {
+            // 累加点云统计
             pcr_fix += pcrs_world[i];
+            // 将每个点转换到世界坐标系并添加到固定点数组
             for (pointVar pv : sw->points[mp[i]])
             {
               pv.pnt = x_buf[i].R * pv.pnt + x_buf[i].p;
@@ -1369,16 +1553,19 @@ public:
             }
           }
       }
-      else
+      else // 固定点已达上限,不再添加新点
       {
+        // 从累加结果中减去将被边缘化的点云
         for (int i = 0; i < mgsize; i++)
           if (pcrs_world[i].N != 0)
             pcr_add -= pcrs_world[i];
 
+        // 清空固定点数组以节省内存
         if (point_fix.size() != 0)
           PVec().swap(point_fix);
       }
 
+      // 清理边缘化帧在滑动窗口中的数据
       for (int i = 0; i < mgsize; i++)
         if (sw->pcrs_local[mp[i]].N != 0)
         {
@@ -1386,45 +1573,64 @@ public:
           sw->points[mp[i]].clear();
         }
 
+      // 更新节点有效性状态:如果所有点都变成固定点,则标记为无效
       if (pcr_fix.N >= pcr_add.N)
         isexist = false;
       else
         isexist = true;
 
+      // 解锁
       mVox.unlock();
     }
-    else
+    else // 非叶子节点或根节点处理
     {
+      // 默认标记为无效
       isexist = false;
+      // 递归处理子节点
       for (int i = 0; i < 8; i++)
         if (leaves[i] != nullptr)
         {
           leaves[i]->margi(win_count, mgsize, x_buf, vox_opt);
+          // 如果任何子节点有效,则当前节点也标记为有效
           isexist = isexist || leaves[i]->isexist;
         }
     }
   }
 
-  // Extract the LiDAR factor
+  /**
+   * 提取用于LiDAR优化的因子
+   * 遍历八叉树结构,找出符合条件的平面特征并添加到优化因子中
+   * @param vox_opt LiDAR因子对象,用于收集各个体素的平面特征
+   */
   void tras_opt(LidarFactor &vox_opt)
   {
+    // 处理叶子节点
     if (octo_state == 0)
     {
+      // 检查节点是否有效且包含平面特征
       if (layer >= 0 && isexist && plane.is_plane && sw != nullptr)
       {
+        // 额外的平面质量检查:如果最小特征值与次小特征值比值大于0.12,
+        // 说明平面不够"平",放弃使用该特征
         if (eig_value[0] / eig_value[1] > 0.12)
           return;
 
+        // 设置权重系数为1(可以根据平面质量调整)
         double coe = 1;
+        // 创建点云集合副本,用于优化
         vector<PointCluster> pcrs(wdsize);
+        // 复制各帧在该节点中的局部点云
         for (int i = 0; i < wdsize; i++)
           pcrs[i] = sw->pcrs_local[mp[i]];
+        // 记录该节点在优化因子中的索引,用于后续更新
         opt_state = vox_opt.plvec_voxels.size();
+        // 将节点的点云数据添加到优化因子中
         vox_opt.push_voxel(pcrs, pcr_fix, coe, eig_value, eig_vector, pcr_add);
       }
     }
-    else
+    else // 处理非叶子节点
     {
+      // 递归地处理所有非空子节点
       for (int i = 0; i < 8; i++)
         if (leaves[i] != nullptr)
           leaves[i]->tras_opt(vox_opt);
@@ -1514,14 +1720,25 @@ public:
     return flag;
   }
 
+  /**
+   * 收集八叉树中所有子节点指针到列表中
+   * 该函数用于遍历八叉树结构并将所有子节点添加到指定的列表中
+   * 通常用于内存管理,如批量释放节点等操作
+   * @param octos_release 用于存储收集到的节点指针列表
+   */
   void tras_ptr(vector<OctoTree *> &octos_release)
   {
+    // 只处理内部节点(非叶子节点)
     if (octo_state == 1)
     {
+      // 遍历所有8个可能的子节点
       for (int i = 0; i < 8; i++)
+        // 对非空子节点进行处理
         if (leaves[i] != nullptr)
         {
+          // 将子节点指针添加到列表中
           octos_release.push_back(leaves[i]);
+          // 递归地收集子节点的子节点
           leaves[i]->tras_ptr(octos_release);
         }
     }
@@ -1537,24 +1754,37 @@ public:
   //   }
   // }
 
-  // Extract the point cloud map for debug
+  /**
+   * 提取八叉树中的点云数据用于可视化调试
+   * 该函数遍历八叉树结构,收集满足特定条件的点云并转换到指定的输出点云容器中
+   * @param win_count 滑动窗口中的帧数
+   * @param pl_fixd 输出参数,用于存储固定点云(注意:当前实现中此参数未被实际使用,相关代码被注释)
+   * @param pl_wind 输出参数,用于存储滑动窗口中的动态点云
+   * @param x_buf 包含位姿转换信息的缓冲区,用于将点从局部坐标系转换到全局坐标系
+   */
   void tras_display(int win_count, pcl::PointCloud<PointType> &pl_fixd, pcl::PointCloud<PointType> &pl_wind, vector<IMUST> &x_buf)
   {
+    // 处理叶子节点
     if (octo_state == 0)
     {
+      // 计算点云协方差矩阵的特征值和特征向量
       Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(pcr_add.cov());
       Eigen::Matrix3d eig_vectors = saes.eigenvectors();
       Eigen::Vector3d eig_values = saes.eigenvalues();
 
+      // 定义点云中的点
       PointType ap;
-      // ap.intensity = ins;
+      // ap.intensity = ins; // 注释掉的强度设置
 
+      // 如果当前节点包含有效平面
       if (plane.is_plane)
       {
+        // 以下被注释的代码用于筛选特定条件的平面
         // if(pcr_add.N-pcr_fix.N < min_ba_point) return;
         // if(eig_value[0]/eig_value[1] > 0.1)
         //   return;
 
+        // 以下被注释的代码用于处理固定点云
         // for(pointVar &pv: point_fix)
         // {
         //   Eigen::Vector3d pvec = pv.pnt;
@@ -1568,13 +1798,17 @@ public:
         //   pl_fixd.push_back(ap);
         // }
 
+        // 遍历所有窗口中的帧
         for (int i = 0; i < win_count; i++)
+          // 处理每一帧中的点
           for (pointVar &pv : sw->points[mp[i]])
           {
+            // 将点从局部坐标系转换到全局坐标系
             Eigen::Vector3d pvec = x_buf[i].R * pv.pnt + x_buf[i].p;
             ap.x = pvec[0];
             ap.y = pvec[1];
             ap.z = pvec[2];
+            // 以下被注释的代码用于设置点的法线和曲率等属性
             // ap.normal_x = sqrt(eig_values[0]);
             // ap.normal_y = sqrt(eig_values[2] / eig_values[0]);
             // ap.normal_z = pcr_add.N;
@@ -1583,17 +1817,28 @@ public:
           }
       }
     }
-    else
+    else // 处理非叶子节点
     {
+      // 递归处理所有非空子节点
       for (int i = 0; i < 8; i++)
         if (leaves[i] != nullptr)
           leaves[i]->tras_display(win_count, pl_fixd, pl_wind, x_buf);
     }
   }
 
+  /**
+   * 判断给定三维点是否在当前体素内部
+   * 该函数通过比较点的坐标与体素的边界来判断点是否位于体素内
+   * 在点云处理、特征匹配和空间查询等操作中非常重要
+   * @param wld 待检测的三维点坐标(以引用方式传入)
+   * @return 如果点在体素内部返回true，否则返回false
+   */
   bool inside(Eigen::Vector3d &wld)
   {
+    // 计算体素半长度(quater_length是四分之一长度，所以乘以2得到半长度)
     double hl = quater_length * 2;
+    // 检查点是否在体素的六个面所围成的立方体内部
+    // 即检查点的每个坐标是否在体素中心正负半长度的范围内
     return (wld[0] >= voxel_center[0] - hl &&
             wld[0] <= voxel_center[0] + hl &&
             wld[1] >= voxel_center[1] - hl &&
@@ -1602,115 +1847,181 @@ public:
             wld[2] <= voxel_center[2] + hl);
   }
 
+  /**
+   * 清理八叉树中的滑动窗口数据
+   * 该函数递归地释放整个八叉树中所有节点关联的滑动窗口资源
+   * 并将清空的滑动窗口对象收集到传入的列表中以便后续复用
+   * @param sws 用于收集释放后的滑动窗口对象的列表
+   */
   void clear_slwd(vector<SlideWindow *> &sws)
   {
+    // 如果不是叶子节点，递归处理所有子节点
     if (octo_state != 0)
     {
+      // 遍历所有可能的子节点
       for (int i = 0; i < 8; i++)
+        // 对非空子节点递归调用清理函数
         if (leaves[i] != nullptr)
         {
           leaves[i]->clear_slwd(sws);
         }
     }
 
+    // 处理当前节点的滑动窗口
     if (sw != nullptr)
     {
+      // 清空滑动窗口中的数据
       sw->clear();
+      // 将清空后的滑动窗口对象添加到回收列表
       sws.push_back(sw);
+      // 断开当前节点与滑动窗口的关联
       sw = nullptr;
     }
   }
 };
 
-// feat_map: 特征体素地图，是一个哈希表，键为体素位置(VOXEL_LOC)，值为八叉树节点指针
-// pvec: 点云向量指针，存储了当前帧的所有点及其属性
-// win_count: 当前点云在滑动窗口中的索引
-// feat_tem_map: 临时体素地图，存储当前帧涉及的体素
-// wdsize: 滑动窗口大小
-// pwld: 世界坐标系下的点位置向量
-// sws: 滑动窗口数据结构，用于管理点与位姿的关联
+/**
+ * 将点云数据分配到体素网格中并建立或更新八叉树结构
+ * 该函数处理一帧点云数据，将每个点根据其空间位置分配到相应的体素中
+ * 并在需要时创建新的八叉树节点或更新现有节点
+ * 
+ * @param feat_map 存储所有体素及其对应八叉树节点的哈希表
+ * @param pvec 输入点云数据指针，包含点的位置和协方差信息
+ * @param win_count 当前滑动窗口的索引或帧计数
+ * @param feat_tem_map 临时哈希表，用于存储当前帧处理过的体素
+ * @param wdsize 滑动窗口的大小
+ * @param pwld 世界坐标系下的点云位置向量
+ * @param sws 可重用的滑动窗口对象列表
+ */
 void cut_voxel(unordered_map<VOXEL_LOC, OctoTree *> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree *> &feat_tem_map, int wdsize, PLV(3) & pwld, vector<SlideWindow *> &sws)
 {
-  int plsize = pvec->size(); // 获取点云中点的数量
-  for (int i = 0; i < plsize; i++) // 遍历每个点
-  {
-    pointVar &pv = (*pvec)[i]; // 获取当前点的引用（包含点的位置和协方差）
-    Eigen::Vector3d &pw = pwld[i]; // 获取对应的世界坐标点引用
-
-    float loc[3]; // 用于存储体素坐标
-    for (int j = 0; j < 3; j++) // 计算点所在的体素坐标
-    {
-      loc[j] = pw[j] / voxel_size;
-      if (loc[j] < 0) // 处理负坐标的特殊情况
-        loc[j] -= 1;
-    }
-
-    VOXEL_LOC position(loc[0], loc[1], loc[2]); // 创建体素位置对象
-    auto iter = feat_map.find(position); // 在体素地图中查找该位置
-    if (iter != feat_map.end()) // 如果该体素已存在
-    {
-      iter->second->allocate(win_count, pv, pw, sws); // 将点分配到现有八叉树
-      iter->second->isexist = true; // 标记该体素节点存在点
-      if (feat_tem_map.find(position) == feat_map.end()) // 如果临时地图中不存在该体素
-        feat_tem_map[position] = iter->second; // 将其添加到临时地图
-    }
-    else // 如果体素不存在
-    {
-      OctoTree *ot = new OctoTree(0, wdsize); // 创建新的八叉树节点
-      ot->allocate(win_count, pv, pw, sws); // 分配点到该节点
-      // 设置体素中心坐标（体素索引坐标 + 0.5 然后乘以体素大小）
-      ot->voxel_center[0] = (0.5 + position.x) * voxel_size;
-      ot->voxel_center[1] = (0.5 + position.y) * voxel_size;
-      ot->voxel_center[2] = (0.5 + position.z) * voxel_size;
-      ot->quater_length = voxel_size / 4.0; // 设置四分之一边长（八叉树细分时使用）
-      feat_map[position] = ot; // 将新节点添加到主体素地图
-      feat_tem_map[position] = ot; // 同时添加到临时地图
-    }
-  }
-}
-
-// Cut the current scan into corresponding voxel in multi thread
-void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree *> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree *> &feat_tem_map, int wdsize, PLV(3) & pwld, vector<vector<SlideWindow *>> &sws)
-{
-  unordered_map<OctoTree *, vector<int>> map_pvec;
+  // 获取点云大小
   int plsize = pvec->size();
+  // 遍历所有点
   for (int i = 0; i < plsize; i++)
   {
+    // 获取当前点的引用及其世界坐标
     pointVar &pv = (*pvec)[i];
     Eigen::Vector3d &pw = pwld[i];
+    // 计算点所在的体素索引
     float loc[3];
     for (int j = 0; j < 3; j++)
     {
-      // loc[j] = pv.world[j] / voxel_size;
+      // 将世界坐标除以体素大小得到体素索引
       loc[j] = pw[j] / voxel_size;
+      // 负坐标的特殊处理，确保正确映射到整数索引
       if (loc[j] < 0)
         loc[j] -= 1;
     }
 
+    // 创建体素位置标识符
     VOXEL_LOC position(loc[0], loc[1], loc[2]);
+    // 在现有体素表中查找当前位置
     auto iter = feat_map.find(position);
-    OctoTree *ot = nullptr;
+    // 如果该体素已存在
     if (iter != feat_map.end())
     {
+      // 将点分配到现有八叉树节点
+      iter->second->allocate(win_count, pv, pw, sws);
+      // 标记该节点包含有效数据
       iter->second->isexist = true;
+      // 将该体素添加到临时表中(如果尚未添加)
       if (feat_tem_map.find(position) == feat_map.end())
         feat_tem_map[position] = iter->second;
-      ot = iter->second;
     }
-    else
+    else // 如果该位置没有体素
     {
-      ot = new OctoTree(0, wdsize);
+      // 创建新的八叉树节点(初始层级为0)
+      OctoTree *ot = new OctoTree(0, wdsize);
+      // 分配点到新节点
+      ot->allocate(win_count, pv, pw, sws);
+      // 设置体素中心坐标(加0.5是为了获取体素中心而非边缘)
       ot->voxel_center[0] = (0.5 + position.x) * voxel_size;
       ot->voxel_center[1] = (0.5 + position.y) * voxel_size;
       ot->voxel_center[2] = (0.5 + position.z) * voxel_size;
+      // 设置体素四分之一长度(用于子节点划分)
       ot->quater_length = voxel_size / 4.0;
+      // 将新节点添加到体素表和临时表中
+      feat_map[position] = ot;
+      feat_tem_map[position] = ot;
+    }
+  }
+}
+
+/**
+ * 多线程版本的点云体素化与八叉树构建函数
+ * 该函数通过多线程并行处理方式，将点云数据分配到空间体素中
+ * 相比单线程版本，提高了大规模点云处理的效率
+ * 
+ * @param feat_map 存储所有体素及其对应八叉树节点的哈希表
+ * @param pvec 输入点云数据指针，包含点的位置和协方差信息
+ * @param win_count 当前滑动窗口的索引或帧计数
+ * @param feat_tem_map 临时哈希表，用于存储当前帧处理过的体素
+ * @param wdsize 滑动窗口的大小
+ * @param pwld 世界坐标系下的点云位置向量
+ * @param sws 多线程使用的滑动窗口对象二维数组，每个线程使用一组滑动窗口
+ */
+void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree *> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree *> &feat_tem_map, int wdsize, PLV(3) & pwld, vector<vector<SlideWindow *>> &sws)
+{
+  // 创建映射表，记录每个八叉树节点对应的点云索引
+  unordered_map<OctoTree *, vector<int>> map_pvec;
+  // 获取点云大小
+  int plsize = pvec->size();
+  // 第一阶段：遍历所有点，确定每个点所属的体素
+  for (int i = 0; i < plsize; i++)
+  {
+    // 获取当前点的引用及其世界坐标
+    pointVar &pv = (*pvec)[i];
+    Eigen::Vector3d &pw = pwld[i];
+    // 计算点所在的体素索引
+    float loc[3];
+    for (int j = 0; j < 3; j++)
+    {
+      // 注释掉的代码可能是旧版本实现
+      // loc[j] = pv.world[j] / voxel_size;
+      // 将世界坐标除以体素大小得到体素索引
+      loc[j] = pw[j] / voxel_size;
+      // 负坐标的特殊处理，确保正确映射到整数索引
+      if (loc[j] < 0)
+        loc[j] -= 1;
+    }
+
+    // 创建体素位置标识符
+    VOXEL_LOC position(loc[0], loc[1], loc[2]);
+    // 在现有体素表中查找当前位置
+    auto iter = feat_map.find(position);
+    OctoTree *ot = nullptr;
+    // 如果该体素已存在
+    if (iter != feat_map.end())
+    {
+      // 标记该节点包含有效数据
+      iter->second->isexist = true;
+      // 将该体素添加到临时表中(如果尚未添加)
+      if (feat_tem_map.find(position) == feat_map.end())
+        feat_tem_map[position] = iter->second;
+      // 获取体素对应的八叉树节点
+      ot = iter->second;
+    }
+    else // 如果该位置没有体素
+    {
+      // 创建新的八叉树节点(初始层级为0)
+      ot = new OctoTree(0, wdsize);
+      // 设置体素中心坐标(加0.5是为了获取体素中心而非边缘)
+      ot->voxel_center[0] = (0.5 + position.x) * voxel_size;
+      ot->voxel_center[1] = (0.5 + position.y) * voxel_size;
+      ot->voxel_center[2] = (0.5 + position.z) * voxel_size;
+      // 设置体素四分之一长度(用于子节点划分)
+      ot->quater_length = voxel_size / 4.0;
+      // 将新节点添加到体素表和临时表中
       feat_map[position] = ot;
       feat_tem_map[position] = ot;
     }
 
+    // 记录点云索引到对应的八叉树节点
     map_pvec[ot].push_back(i);
   }
 
+  // 注释掉的单线程实现代码
   // for(auto iter=map_pvec.begin(); iter!=map_pvec.end(); iter++)
   // {
   //   for(int i: iter->second)
@@ -1719,119 +2030,177 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree *> &feat_map, PVecPtr pve
   //   }
   // }
 
+  // 将哈希表转换为向量以便并行处理
   vector<pair<OctoTree *const, vector<int>> *> octs;
   octs.reserve(map_pvec.size());
   for (auto iter = map_pvec.begin(); iter != map_pvec.end(); iter++)
     octs.push_back(&(*iter));
 
+  // 线程数等于滑动窗口组的数量
   int thd_num = sws.size();
+  // 获取总的体素数量
   int g_size = octs.size();
+  // 如果体素数量少于线程数，直接返回
   if (g_size < thd_num)
     return;
+  // 创建线程数组
   vector<thread *> mthreads(thd_num);
+  // 计算每个线程需要处理的体素数量
   double part = 1.0 * g_size / thd_num;
 
+  // 重新分配滑动窗口资源，确保每个线程有足够的滑动窗口
   int swsize = sws[0].size() / thd_num;
   for (int i = 1; i < thd_num; i++)
   {
+    // 将部分滑动窗口从第一组移动到其他组
     sws[i].insert(sws[i].end(), sws[0].end() - swsize, sws[0].end());
     sws[0].erase(sws[0].end() - swsize, sws[0].end());
   }
 
+  // 创建并启动工作线程(除了主线程外)
   for (int i = 1; i < thd_num; i++)
   {
     mthreads[i] = new thread(
+        // 线程工作函数：处理分配给该线程的体素和点云
         [&](int head, int tail, vector<SlideWindow *> &sw)
         {
           for (int j = head; j < tail; j++)
           {
+            // 遍历该体素中的所有点索引
             for (int k : octs[j]->second)
+              // 将点分配到八叉树节点
               octs[j]->first->allocate(win_count, (*pvec)[k], pwld[k], sw);
           }
         },
+        // 线程处理的体素范围和使用的滑动窗口组
         part * i, part * (i + 1), ref(sws[i]));
   }
 
+  // 等待所有线程完成并释放资源
   for (int i = 0; i < thd_num; i++)
   {
     if (i == 0)
     {
+      // 主线程处理第一部分体素
       for (int j = 0; j < int(part); j++)
         for (int k : octs[j]->second)
           octs[j]->first->allocate(win_count, (*pvec)[k], pwld[k], sws[0]);
     }
     else
     {
+      // 等待其他线程完成并释放资源
       mthreads[i]->join();
       delete mthreads[i];
     }
   }
 }
 
+/**
+ * 处理固定点云数据的体素化函数
+ * 该函数将固定点云分配到八叉树结构中，用于地图构建和维护
+ * 与处理动态点云的cut_voxel函数不同，此函数专门处理不随位姿优化变化的固定点
+ * 
+ * @param feat_map 存储所有体素及其对应八叉树节点的哈希表
+ * @param pvec 输入固定点云数据，包含点的位置和协方差信息
+ * @param wdsize 滑动窗口的大小
+ * @param jour 时间戳或序号，用于记录点云添加的时间
+ */
 void cut_voxel(unordered_map<VOXEL_LOC, OctoTree *> &feat_map, PVec &pvec, int wdsize, double jour)
 {
+  // 遍历所有固定点
   for (pointVar &pv : pvec)
   {
+    // 计算点所在的体素索引
     float loc[3];
     for (int j = 0; j < 3; j++)
     {
+      // 将点坐标除以体素大小得到体素索引
       loc[j] = pv.pnt[j] / voxel_size;
+      // 负坐标的特殊处理，确保正确映射到整数索引
       if (loc[j] < 0)
         loc[j] -= 1;
     }
 
+    // 创建体素位置标识符
     VOXEL_LOC position(loc[0], loc[1], loc[2]);
+    // 在现有体素表中查找当前位置
     auto iter = feat_map.find(position);
+    // 如果该体素已存在
     if (iter != feat_map.end())
     {
+      // 将固定点添加到现有八叉树节点
       iter->second->allocate_fix(pv);
     }
-    else
+    else // 如果该位置没有体素
     {
+      // 创建新的八叉树节点(初始层级为0)
       OctoTree *ot = new OctoTree(0, wdsize);
+      // 添加固定点到新节点(不带协方差)
       ot->push_fix_novar(pv);
+      // 设置体素中心坐标(加0.5是为了获取体素中心而非边缘)
       ot->voxel_center[0] = (0.5 + position.x) * voxel_size;
       ot->voxel_center[1] = (0.5 + position.y) * voxel_size;
       ot->voxel_center[2] = (0.5 + position.z) * voxel_size;
+      // 设置体素四分之一长度(用于子节点划分)
       ot->quater_length = voxel_size / 4.0;
+      // 记录时间戳或序号
       ot->jour = jour;
+      // 将新节点添加到体素表中
       feat_map[position] = ot;
     }
   }
 }
 
-// Match the point with the plane in the voxel map
+/**
+ * 在体素地图中进行点与平面的匹配
+ * 该函数在八叉树体素地图中查找给定三维点所在的体素，并尝试将其与该体素中的平面特征进行匹配
+ * 通常用于点云配准、特征关联或数据关联等任务
+ * 
+ * @param feat_map 体素地图，一个哈希表，键为体素位置，值为八叉树节点指针
+ * @param wld 待匹配的三维点坐标(以引用方式传入)
+ * @param pla 输出参数，指向匹配到的平面的指针(如果匹配成功)
+ * @param var_wld 输出参数，匹配点的协方差矩阵
+ * @param sigma_d 输出参数，点到平面的标准差或不确定性度量
+ * @param oc 输出参数，匹配到的八叉树节点指针
+ * @return 匹配结果标志：0表示未匹配，非0表示匹配成功
+ */
 int match(unordered_map<VOXEL_LOC, OctoTree *> &feat_map, Eigen::Vector3d &wld, Plane *&pla, Eigen::Matrix3d &var_wld, double &sigma_d, OctoTree *&oc)
 {
+  // 初始化匹配标志为0(未匹配)
   int flag = 0;
 
   // 计算点所在的体素位置
   float loc[3];
   for (int j = 0; j < 3; j++)
   {
-    loc[j] = wld[j] / voxel_size; // 将世界坐标除以体素大小得到体素坐标
+    // 将世界坐标除以体素大小得到体素坐标
+    loc[j] = wld[j] / voxel_size;
+    // 负坐标需要向下取整，以确保索引的正确性
     if (loc[j] < 0)
-      loc[j] -= 1; // 负坐标需要向下取整
+      loc[j] -= 1;
   }
   
-  // 构造体素位置索引
+  // 构造体素位置索引对象
   VOXEL_LOC position(loc[0], loc[1], loc[2]);
   
   // 在体素地图中查找对应位置的节点
   auto iter = feat_map.find(position);
+  // 如果找到了对应的体素节点
   if (iter != feat_map.end())
   {
+    // 初始化最大匹配概率
     double max_prob = 0;
-    // 在找到的体素节点中进行点与平面的匹配
+    // 调用找到的体素节点的match方法进行点与平面的详细匹配
     flag = iter->second->match(wld, pla, max_prob, var_wld, sigma_d, oc);
     
-    // 如果匹配成功但平面指针为空,输出错误信息
+    // 调试检查：如果匹配成功但平面指针为空，输出错误信息
     if (flag && pla == nullptr)
     {
       printf("pla null max_prob: %lf %ld %ld %ld\n", max_prob, iter->first.x, iter->first.y, iter->first.z);
     }
   }
 
+  // 返回匹配结果
   return flag;
 }
 
